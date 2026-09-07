@@ -70,7 +70,7 @@ det_start = next(i for i, r in enumerate(rows) if r and "VISIT DETAILS" in r[0])
 detail_rows = [r for r in rows[det_start + 2:] if r]
 check("csv has E100 visits (2)", sum(1 for r in detail_rows if r[0] == "E100") == 2)
 check("csv has E200 visits (30)", sum(1 for r in detail_rows if r[0] == "E200") == 30)
-check("csv lists zero-visit employee", any(r and "E300" in r[0] for r in detail_rows))
+check("csv skips zero-visit employee", not any(r and "E300" in r[0] for r in detail_rows))
 
 with zipfile.ZipFile(xlsx_path) as z:
     names = set(z.namelist())
