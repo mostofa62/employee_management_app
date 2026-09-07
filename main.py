@@ -2,7 +2,7 @@ import datetime
 import os
 import tempfile
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 from PIL import Image, ImageTk
 
 import db
@@ -25,6 +25,251 @@ def _make_tree(parent, columns):
         tree.heading(cid, text=text)
         tree.column(cid, width=width, anchor=anchor)
     return frame, tree
+
+
+# ── Calendar / Date Picker ───────────────────────────────────
+import calendar as _cal
+
+def _parse_iso_date(text):
+    s = (text or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+def _open_calendar(var, parent_widget, title="Select date", disable_future=False):
+    # try tkcalendar first if available
+    try:
+        from tkcalendar import Calendar as _TKCal  # type: ignore
+        top = tk.Toplevel(parent_widget)
+        top.title(title)
+        top.resizable(False, False)
+        top.transient(parent_widget)
+        top.grab_set()
+        init = _parse_iso_date(var.get()) or datetime.date.today()
+        cal_kwargs = dict(selectmode="day", year=init.year, month=init.month, day=init.day,
+                          date_pattern="yyyy-mm-dd", showweeknumbers=False)
+        if disable_future:
+            cal_kwargs["maxdate"] = datetime.date.today()
+        cal = _TKCal(top, **cal_kwargs)
+        cal.pack(padx=10, pady=10)
+        def _pick():
+            sel = cal.get_date()
+            # enforce disable_future
+            if disable_future:
+                try:
+                    d = datetime.datetime.strptime(sel, "%Y-%m-%d").date()
+                    if d > datetime.date.today():
+                        messagebox.showwarning("Invalid date", "Future dates are not allowed.", parent=top)
+                        return
+                except Exception:
+                    pass
+            var.set(sel)
+            top.destroy()
+        btns = ttk.Frame(top)
+        btns.pack(fill="x", padx=10, pady=(0,10))
+        ttk.Button(btns, text="Today", command=lambda: cal.selection_set(datetime.date.today())).pack(side="left")
+        ttk.Button(btns, text="Select", command=_pick).pack(side="right", padx=4)
+        ttk.Button(btns, text="Cancel", command=top.destroy).pack(side="right")
+        # position near widget
+        try:
+            x = parent_widget.winfo_rootx() + 20
+            y = parent_widget.winfo_rooty() + parent_widget.winfo_height() + 6
+            top.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        top.wait_window()
+        return
+    except Exception:
+        pass
+    _CalendarPopup(var, parent_widget, title, disable_future=disable_future)
+
+
+class _CalendarPopup(tk.Toplevel):
+    def __init__(self, var, parent_widget, title="Select date", disable_future=False):
+        super().__init__(parent_widget)
+        self.var = var
+        self.disable_future = bool(disable_future)
+        self._today = datetime.date.today()
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(parent_widget)
+        # self.grab_set() will be set after wait_visibility
+        self._sel = _parse_iso_date(var.get()) or self._today
+        # clamp initial selection to today if future disabled
+        if self.disable_future and self._sel > self._today:
+            self._sel = self._today
+        self._view_year = self._sel.year
+        self._view_month = self._sel.month
+        self._build()
+        # position near parent widget
+        try:
+            self.update_idletasks()
+            x = parent_widget.winfo_rootx() + 10
+            y = parent_widget.winfo_rooty() + parent_widget.winfo_height() + 4
+            # keep on screen
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            w = self.winfo_reqwidth()
+            h = self.winfo_reqheight()
+            if x + w > sw - 10:
+                x = sw - w - 10
+            if y + h > sh - 40:
+                y = parent_widget.winfo_rooty() - h - 4
+                if y < 0:
+                    y = 10
+            self.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        self.wait_visibility()
+        self.grab_set()
+        self.focus_set()
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<FocusOut>", self._on_focus_out)
+
+    def _on_focus_out(self, evt):
+        # don't close if focus goes to child
+        try:
+            if evt.widget is self and self.focus_get() is None:
+                return
+        except Exception:
+            pass
+
+    def _build(self):
+        outer = ttk.Frame(self, padding=8)
+        outer.pack(fill="both", expand=True)
+
+        nav = ttk.Frame(outer)
+        nav.pack(fill="x", pady=(0, 6))
+        self.btn_prev_year = ttk.Button(nav, width=3, text="◀◀", command=self._prev_year)
+        self.btn_prev_year.pack(side="left")
+        self.btn_prev_month = ttk.Button(nav, width=3, text="◀", command=self._prev_month)
+        self.btn_prev_month.pack(side="left", padx=2)
+        self.lbl_month = ttk.Label(nav, anchor="center", font=("Segoe UI", 10, "bold"))
+        self.lbl_month.pack(side="left", expand=True, fill="x")
+        self.btn_next_month = ttk.Button(nav, width=3, text="▶", command=self._next_month)
+        self.btn_next_month.pack(side="right", padx=2)
+        self.btn_next_year = ttk.Button(nav, width=3, text="▶▶", command=self._next_year)
+        self.btn_next_year.pack(side="right")
+
+        # weekday header
+        hdr = ttk.Frame(outer)
+        hdr.pack(fill="x")
+        for idx, name in enumerate(["Mo","Tu","We","Th","Fr","Sa","Su"]):
+            ttk.Label(hdr, text=name, anchor="center", width=4, font=("Segoe UI", 9, "bold"),
+                      foreground="#006633" if idx < 5 else "#aa0000").grid(row=0, column=idx, padx=1)
+
+        self.grid_frame = ttk.Frame(outer)
+        self.grid_frame.pack(pady=(4, 6))
+
+        bottom = ttk.Frame(outer)
+        bottom.pack(fill="x", pady=(6, 0))
+        ttk.Button(bottom, text="Today", command=self._go_today).pack(side="left")
+        ttk.Button(bottom, text="Clear", command=self._clear).pack(side="left", padx=4)
+        ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right")
+
+        self._refresh()
+
+    def _refresh(self):
+        self.lbl_month.config(text=f"{_cal.month_name[self._view_month]} {self._view_year}")
+        # navigation disable for future if needed
+        if self.disable_future:
+            # disable next if viewing current or future month
+            cur_y, cur_m = self._today.year, self._today.month
+            is_cur_or_future_month = (self._view_year, self._view_month) >= (cur_y, cur_m)
+            is_cur_or_future_year = self._view_year >= cur_y
+            try:
+                self.btn_next_month.config(state="disabled" if is_cur_or_future_month else "normal")
+                self.btn_next_year.config(state="disabled" if is_cur_or_future_year else "normal")
+            except Exception:
+                pass
+        for w in self.grid_frame.winfo_children():
+            w.destroy()
+        first_wday, n_days = _cal.monthrange(self._view_year, self._view_month)
+        # monthrange Monday=0 -> our header Monday=0, so offset is first_wday
+        row = 0
+        col = first_wday
+        # leading blanks
+        # we create 6 rows x 7 cols buttons; simpler fill sequentially
+        today = self._today
+        for day in range(1, n_days + 1):
+            d = datetime.date(self._view_year, self._view_month, day)
+            is_today = d == today
+            is_selected = d == self._sel
+            is_future = self.disable_future and d > today
+            # need to place at correct row/col
+            r = (first_wday + day - 1) // 7
+            c = (first_wday + day - 1) % 7
+            if is_future:
+                btn = tk.Button(self.grid_frame, text=str(day), width=4, relief="flat",
+                                bg="#e0e0e0", fg="#9e9e9e",
+                                font=("Segoe UI", 9, "normal"),
+                                bd=1, highlightthickness=0, state="disabled")
+            else:
+                btn = tk.Button(self.grid_frame, text=str(day), width=4, relief="flat",
+                                bg=("#e8f5e9" if is_selected else ("#fff3cd" if is_today else "white")),
+                                fg=("#006633" if is_selected else ("#aa0000" if c >=5 else "black")),
+                                font=("Segoe UI", 9, "bold" if is_selected or is_today else "normal"),
+                                bd=1, highlightthickness=0,
+                                command=lambda d=d: self._pick(d))
+                # hover
+                btn.bind("<Enter>", lambda e, b=btn: b.config(bg="#c8e6c9") if b["bg"] not in ("#e8f5e9",) else None)
+                btn.bind("<Leave>", lambda e, b=btn, sel=is_selected, td=is_today: b.config(bg=("#e8f5e9" if sel else ("#fff3cd" if td else "white"))))
+                if is_selected:
+                    btn.config(relief="solid", bd=1)
+            btn.grid(row=r, column=c, padx=1, pady=1, ipadx=2, ipady=2)
+
+    def _pick(self, d):
+        if self.disable_future and d > self._today:
+            messagebox.showwarning("Invalid date", "Future dates are not allowed for tenure.", parent=self)
+            return
+        self.var.set(d.isoformat())
+        self.destroy()
+
+    def _prev_month(self):
+        if self._view_month == 1:
+            self._view_month = 12
+            self._view_year -= 1
+        else:
+            self._view_month -= 1
+        self._refresh()
+
+    def _next_month(self):
+        if self._view_month == 12:
+            self._view_month = 1
+            self._view_year += 1
+        else:
+            self._view_month += 1
+        self._refresh()
+
+    def _prev_year(self):
+        self._view_year -= 1
+        self._refresh()
+
+    def _next_year(self):
+        self._view_year += 1
+        self._refresh()
+
+    def _go_today(self):
+        t = datetime.date.today()
+        self._view_year, self._view_month = t.year, t.month
+        self._sel = t
+        self._refresh()
+        self.var.set(t.isoformat())
+
+    def _clear(self):
+        self.var.set("")
+        self.destroy()
+
+def _make_date_picker_button(parent_frame, var, anchor_widget=None, disable_future=False):
+    """Add a small calendar button next to an Entry bound to var. Returns button."""
+    # Use text "Cal" (ASCII-safe) instead of emoji to avoid cp1252 console issues;
+    # Tk renders fine; emoji can be enabled by changing to "\U0001F4C5" if font supports it.
+    btn = ttk.Button(parent_frame, text="Cal", width=4,
+                     command=lambda: _open_calendar(var, anchor_widget or parent_frame, disable_future=disable_future))
+    return btn
 
 
 class EmployeeDialog(tk.Toplevel):
@@ -158,8 +403,10 @@ class VisitForm(ttk.Frame):
         ttk.Label(self, text="Date of visit *").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=4)
         date_wrap = ttk.Frame(self)
         date_wrap.grid(row=4, column=1, sticky="w", pady=4)
-        ttk.Entry(date_wrap, textvariable=self.var_date, width=13).pack(side="left")
-        ttk.Label(date_wrap, text=f"  ({DATE_HINT})").pack(side="left")
+        self.ent_date = ttk.Entry(date_wrap, textvariable=self.var_date, width=13)
+        self.ent_date.pack(side="left")
+        _make_date_picker_button(date_wrap, self.var_date, self.ent_date, disable_future=False).pack(side="left", padx=(4, 0))
+        ttk.Label(date_wrap, text=f"  ({DATE_HINT})").pack(side="left", padx=(4, 0))
 
         self.columnconfigure(1, weight=1)
         self.cmb_emp.bind("<<ComboboxSelected>>", lambda e: self._changed())
@@ -255,6 +502,156 @@ class VisitDialog(tk.Toplevel):
         self.destroy()
 
 
+class TenureDialog(tk.Toplevel):
+    def __init__(self, master, tenure=None):
+        super().__init__(master)
+        self.tenure = tenure
+        self.saved = False
+        self.title("Edit Tenure" if tenure else "Add Tenure / Posting")
+        self.resizable(False, False)
+
+        frm = ttk.Frame(self, padding=15)
+        frm.grid(sticky="nsew")
+
+        # Employee combobox
+        ttk.Label(frm, text="Employee *").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.var_emp = tk.StringVar()
+        self.cmb_emp = ttk.Combobox(frm, textvariable=self.var_emp, state="readonly", width=30)
+        emps = db.get_employees()
+        self.emp_map = {f"{r['emp_id']} - {r['name']}": r["emp_id"] for r in emps}
+        self.cmb_emp["values"] = list(self.emp_map.keys())
+        self.cmb_emp.grid(row=0, column=1, sticky="we", pady=4)
+
+        ttk.Label(frm, text="Join date * (YYYY-MM-DD)").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.var_join = tk.StringVar(value=datetime.date.today().isoformat())
+        join_wrap = ttk.Frame(frm)
+        join_wrap.grid(row=1, column=1, sticky="we", pady=4)
+        self.ent_join = ttk.Entry(join_wrap, textvariable=self.var_join, width=24)
+        self.ent_join.pack(side="left")
+        self.btn_join_cal = _make_date_picker_button(join_wrap, self.var_join, self.ent_join, disable_future=True)
+        self.btn_join_cal.pack(side="left", padx=(4, 0))
+
+        ttk.Label(frm, text="Release date (YYYY-MM-DD)").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
+        release_wrap = ttk.Frame(frm)
+        release_wrap.grid(row=2, column=1, sticky="we", pady=4)
+        self.var_release = tk.StringVar()
+        self.ent_release = ttk.Entry(release_wrap, textvariable=self.var_release, width=14)
+        self.ent_release.pack(side="left")
+        self.btn_release_cal = _make_date_picker_button(release_wrap, self.var_release, self.ent_release, disable_future=True)
+        self.btn_release_cal.pack(side="left", padx=(4, 0))
+        self.var_ongoing = tk.BooleanVar(value=True)
+        chk = ttk.Checkbutton(release_wrap, text="Still working (no release)", variable=self.var_ongoing, command=self._toggle_release)
+        chk.pack(side="left", padx=(8, 0))
+
+        ttk.Label(frm, text="Tenure type *").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.var_type = tk.StringVar(value="Government")
+        ttk.Combobox(frm, textvariable=self.var_type, state="readonly", width=28,
+                     values=list(db.TENURE_TYPES)).grid(row=3, column=1, sticky="we", pady=4)
+
+        ttk.Label(frm, text="Project").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.var_project = tk.StringVar()
+        cmb_proj = ttk.Combobox(frm, textvariable=self.var_project, width=28)
+        cmb_proj.grid(row=4, column=1, sticky="we", pady=4)
+        cmb_proj["values"] = [p["name"] for p in db.list_projects()]
+
+        ttk.Label(frm, text="Collaborator Org.").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.var_org = tk.StringVar()
+        cmb_org = ttk.Combobox(frm, textvariable=self.var_org, width=28)
+        cmb_org.grid(row=5, column=1, sticky="we", pady=4)
+        try:
+            cmb_org["values"] = [o["name"] for o in db.list_organizations()]
+        except Exception:
+            cmb_org["values"] = []
+
+        ttk.Label(frm, text="Role / Position").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.var_role = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.var_role, width=32).grid(row=6, column=1, sticky="we", pady=4)
+
+        ttk.Label(frm, text="Notes").grid(row=7, column=0, sticky="nw", padx=(0, 10), pady=4)
+        self.txt_notes = tk.Text(frm, width=34, height=3, wrap="word", relief="solid", bd=1)
+        self.txt_notes.grid(row=7, column=1, sticky="we", pady=4)
+
+        hint = ttk.Label(frm, text="Leave release blank if still working. Type new project/org to create automatically.",
+                         foreground="#666666", wraplength=420, justify="left")
+        hint.grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        if tenure:
+            # tenure is sqlite Row with joins
+            disp = next((k for k, v in self.emp_map.items() if v == tenure["emp_id"]), None)
+            if disp:
+                self.var_emp.set(disp)
+                self.cmb_emp.state(["disabled"])
+            self.var_join.set(tenure["join_date"])
+            if tenure["release_date"]:
+                self.var_release.set(tenure["release_date"])
+                self.var_ongoing.set(False)
+            else:
+                self.var_release.set("")
+                self.var_ongoing.set(True)
+            self.var_type.set(tenure["tenure_type"])
+            self.var_project.set(tenure["project_name"] or "")
+            self.var_org.set(tenure["organization_name"] or "")
+            self.var_role.set(tenure["role"] or "")
+            self.txt_notes.delete("1.0", "end")
+            self.txt_notes.insert("1.0", tenure["notes"] or "")
+
+        self._toggle_release()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=9, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(btns, text="Save", command=self._save).pack(side="left", padx=4)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left")
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.transient(master)
+        self.wait_visibility()
+        self.grab_set()
+        self.focus_set()
+
+    def _toggle_release(self):
+        if self.var_ongoing.get():
+            self.ent_release.configure(state="disabled")
+            try:
+                self.btn_release_cal.configure(state="disabled")
+            except Exception:
+                pass
+            self.var_release.set("")
+        else:
+            self.ent_release.configure(state="normal")
+            try:
+                self.btn_release_cal.configure(state="normal")
+            except Exception:
+                pass
+
+    def _save(self):
+        emp_disp = self.var_emp.get().strip()
+        emp_id = self.emp_map.get(emp_disp)
+        if not emp_id:
+            messagebox.showerror("Invalid input", "Please select an employee.", parent=self)
+            return
+        join_date = self.var_join.get().strip()
+        release_date = None if self.var_ongoing.get() else self.var_release.get().strip() or None
+        tenure_type = self.var_type.get().strip() or "Government"
+        project = " ".join(self.var_project.get().split()) or None
+        organization = " ".join(self.var_org.get().split()) or None
+        role = self.var_role.get().strip()
+        notes = self.txt_notes.get("1.0", "end").strip()
+        try:
+            if self.tenure:
+                db.update_tenure(self.tenure["id"], emp_id, join_date, release_date,
+                                 tenure_type=tenure_type, project=project,
+                                 organization=organization, role=role, notes=notes)
+            else:
+                db.add_tenure(emp_id, join_date, release_date,
+                              tenure_type=tenure_type, project=project,
+                              organization=organization, role=role, notes=notes)
+        except ValueError as exc:
+            messagebox.showerror("Invalid input", str(exc), parent=self)
+            return
+        self.saved = True
+        self.destroy()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -287,14 +684,39 @@ class App(tk.Tk):
         header_frame = ttk.Frame(self, padding=12)
         header_frame.pack(fill="x", side="top")
 
-        if os.path.exists("logo.png"):
+        # Try logo.png first (better for Tk), fallback to logo.svg if PNG missing
+        _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+        _logo_svg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.svg")
+        _logo_found = None
+        if os.path.isfile(_logo_path):
+            _logo_found = _logo_path
+        elif os.path.isfile(_logo_svg):
+            _logo_found = _logo_svg
+        if _logo_found:
             try:
-                pil_img = Image.open("logo.png").resize((52, 52), Image.Resampling.LANCZOS)
+                # Use thumbnail to preserve aspect ratio (logo is portrait 783x954)
+                pil_img = Image.open(_logo_found)
+                # For SVG, PIL may not support - try cairosvg fallback
+                if pil_img.format == "SVG" or _logo_found.lower().endswith(".svg"):
+                    raise ValueError("SVG not directly supported by PIL")
+                pil_img.thumbnail((56, 56), Image.Resampling.LANCZOS)
                 self.logo_img = ImageTk.PhotoImage(pil_img)
                 logo_lbl = ttk.Label(header_frame, image=self.logo_img)
                 logo_lbl.pack(side="left", padx=(0, 14))
             except Exception:
-                pass
+                # Try SVG via cairosvg -> PNG in memory
+                try:
+                    import cairosvg
+                    import io
+                    png_data = cairosvg.svg2png(url=_logo_found, scale=2)
+                    from PIL import Image as _PIL
+                    pil_img = _PIL.open(io.BytesIO(png_data))
+                    pil_img.thumbnail((56, 56), _PIL.Image.Resampling.LANCZOS)
+                    self.logo_img = ImageTk.PhotoImage(pil_img)
+                    logo_lbl = ttk.Label(header_frame, image=self.logo_img)
+                    logo_lbl.pack(side="left", padx=(0, 14))
+                except Exception:
+                    pass
 
         title_wrap = ttk.Frame(header_frame)
         title_wrap.pack(side="left", fill="x", expand=True)
@@ -309,7 +731,7 @@ class App(tk.Tk):
         ttk.Separator(footer_frame, orient="horizontal").pack(fill="x", pady=(0, 4))
         ttk.Label(
             footer_frame,
-            text="This software is developed by Golam Mostofa, Computer Programmer, Chittagong University",
+            text="Courtesy: This software has been developed by Golam Mostofa, Computer Programmer, Chittagong University",
             font=("Segoe UI", 10, "italic"),
             foreground="#555555",
             anchor="center"
@@ -324,17 +746,23 @@ class App(tk.Tk):
         self.nb.pack(fill="both", expand=True, padx=12, pady=8)
         self.tab_emp = ttk.Frame(self.nb, padding=12)
         self.tab_projects = ttk.Frame(self.nb, padding=12)
+        self.tab_orgs = ttk.Frame(self.nb, padding=12)
+        self.tab_tenure = ttk.Frame(self.nb, padding=12)
         self.tab_new = ttk.Frame(self.nb, padding=12)
         self.tab_visits = ttk.Frame(self.nb, padding=12)
         self.tab_summary = ttk.Frame(self.nb, padding=12)
         self.nb.add(self.tab_emp, text=" Employees ")
         self.nb.add(self.tab_projects, text=" Projects ")
+        self.nb.add(self.tab_orgs, text=" Collaborator Orgs ")
+        self.nb.add(self.tab_tenure, text=" Tenure History ")
         self.nb.add(self.tab_new, text=" New Visit ")
         self.nb.add(self.tab_visits, text=" Visit Records ")
         self.nb.add(self.tab_summary, text=" Yearly Summary ")
 
         self._build_employees_tab()
         self._build_projects_tab()
+        self._build_organizations_tab()
+        self._build_tenure_tab()
         self._build_new_visit_tab()
         self._build_visits_tab()
         self._build_summary_tab()
@@ -485,9 +913,111 @@ class App(tk.Tk):
         frame, self.tree_summary = _make_tree(tab, cols)
         frame.grid(row=2, column=0, sticky="nsew")
 
+    def _build_tenure_tab(self):
+        tab = self.tab_tenure
+        tab.rowconfigure(1, weight=2)
+        tab.rowconfigure(3, weight=1)
+        tab.columnconfigure(0, weight=1)
+
+        # Top filter / actions
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(top, text="Employee:").pack(side="left")
+        self.tenure_emp_var = tk.StringVar(value="All employees")
+        self.cmb_tenure_emp = ttk.Combobox(top, textvariable=self.tenure_emp_var, state="readonly", width=28)
+        self.cmb_tenure_emp.pack(side="left", padx=(4, 10))
+        self.cmb_tenure_emp.bind("<<ComboboxSelected>>", lambda e: self.refresh_tenures())
+        ttk.Label(top, text="Type:").pack(side="left")
+        self.tenure_type_var = tk.StringVar(value="All")
+        self.cmb_tenure_type = ttk.Combobox(top, textvariable=self.tenure_type_var, state="readonly", width=12,
+                                            values=["All"] + list(db.TENURE_TYPES))
+        self.cmb_tenure_type.pack(side="left", padx=(4, 10))
+        self.cmb_tenure_type.bind("<<ComboboxSelected>>", lambda e: self.refresh_tenures())
+        ttk.Button(top, text="Add Tenure", command=self.add_tenure).pack(side="left", padx=3)
+        ttk.Button(top, text="Edit Selected", command=self.edit_tenure).pack(side="left", padx=3)
+        ttk.Button(top, text="Delete Selected", command=self.delete_tenure).pack(side="left", padx=3)
+        ttk.Button(top, text="Refresh", command=self.refresh_tenure_tab).pack(side="left", padx=3)
+        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Label(top, text="Report:").pack(side="left")
+        ttk.Button(top, text="Export PDF", command=self.export_tenure_pdf).pack(side="left", padx=3)
+        ttk.Button(top, text="Export Excel", command=self.export_tenure_excel).pack(side="left", padx=3)
+        ttk.Button(top, text="Export CSV", command=self.export_tenure_csv).pack(side="left", padx=3)
+        ttk.Button(top, text="Print", command=self.print_tenure).pack(side="left", padx=3)
+
+        # Tenure details tree (middle)
+        cols = [
+            ("id", "#", 45, "center"),
+            ("emp_id", "Emp ID", 75, "w"),
+            ("emp_name", "Employee", 140, "w"),
+            ("join", "Join Date", 95, "center"),
+            ("release", "Release Date", 105, "center"),
+            ("type", "Type", 95, "w"),
+            ("project", "Project", 115, "w"),
+            ("org", "Collaborator Org", 135, "w"),
+            ("role", "Role", 125, "w"),
+            ("duration", "Duration", 90, "center"),
+        ]
+        frame, self.tree_tenure = _make_tree(tab, cols)
+        frame.grid(row=1, column=0, sticky="nsew", pady=(0, 6))
+        self.tree_tenure.bind("<Double-1>", lambda e: self.edit_tenure())
+        self.tree_tenure.bind("<<TreeviewSelect>>", lambda e: self._on_tenure_select())
+
+        # Summary section label
+        ttk.Separator(tab, orient="horizontal").grid(row=2, column=0, sticky="ew", pady=4)
+        summary_label = ttk.Label(tab, text="Summary: Total time each employee has spent at IEDCR (click a tenure row to see details below)", font=("Segoe UI", 10, "bold"))
+        summary_label.grid(row=2, column=0, sticky="w")
+
+        # Summary tree (bottom) + detail frame side by side
+        bottom = ttk.Frame(tab)
+        bottom.grid(row=3, column=0, sticky="nsew")
+        bottom.columnconfigure(0, weight=1)
+        bottom.columnconfigure(1, weight=1)
+        bottom.rowconfigure(0, weight=1)
+
+        # Left: summary per employee
+        left = ttk.LabelFrame(bottom, text="Total Interval Summary (per employee)", padding=6)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        scols = [
+            ("emp_id", "ID", 70, "w"),
+            ("name", "Name", 135, "w"),
+            ("intervals", "# Periods", 80, "center"),
+            ("total", "Total Time", 110, "center"),
+            ("first_join", "First Join", 95, "center"),
+            ("last_release", "Last Release", 105, "center"),
+            ("status", "Current Status", 115, "w"),
+        ]
+        frame_s, self.tree_tenure_summary = _make_tree(left, scols)
+        frame_s.grid(row=0, column=0, sticky="nsew")
+        self.tree_tenure_summary.bind("<<TreeviewSelect>>", lambda e: self._on_summary_select())
+        self.tree_tenure_summary.bind("<Double-1>", lambda e: self._on_summary_select())
+
+        # Right: detail for selected employee
+        right = ttk.LabelFrame(bottom, text="Details: intervals for selected employee", padding=6)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+        self.tenure_detail_var = tk.StringVar(value="Select an employee in the summary to see all join/release periods.")
+        ttk.Label(right, textvariable=self.tenure_detail_var, wraplength=420, justify="left", font=("Segoe UI", 9)).grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        dcols = [
+            ("join", "Join", 95, "center"),
+            ("release", "Release", 105, "center"),
+            ("type", "Type", 85, "w"),
+            ("project", "Project", 110, "w"),
+            ("role", "Role", 120, "w"),
+            ("duration", "Duration", 85, "center"),
+        ]
+        frame_d, self.tree_tenure_detail = _make_tree(right, dcols)
+        frame_d.grid(row=1, column=0, sticky="nsew")
+
     def refresh_all(self):
         self.refresh_employees()
         self.refresh_projects()
+        self.refresh_organizations()
+        self.refresh_tenure_filters()
+        self.refresh_tenures()
+        self.refresh_tenure_summary()
         self.refresh_visits_filters()
         self.refresh_visits()
         self.refresh_summary_years()
@@ -532,6 +1062,109 @@ class App(tk.Tk):
         frame, self.tree_projects = _make_tree(tab, cols)
         frame.grid(row=1, column=0, sticky="nsew")
 
+    def _build_organizations_tab(self):
+        tab = self.tab_orgs
+        tab.rowconfigure(1, weight=1)
+        tab.columnconfigure(0, weight=1)
+
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(top, text="Organization name:").pack(side="left")
+        self.var_new_org = tk.StringVar()
+        ent = ttk.Entry(top, textvariable=self.var_new_org, width=34)
+        ent.pack(side="left", padx=(4, 8))
+        ent.bind("<Return>", lambda e: self.add_organization())
+        ttk.Button(top, text="Add Organization", command=self.add_organization).pack(side="left", padx=3)
+        ttk.Button(top, text="Delete Selected", command=self.delete_organization).pack(side="left", padx=3)
+        ttk.Button(top, text="Refresh", command=self.refresh_organizations).pack(side="left", padx=3)
+        ttk.Label(top, text="(Same name merged automatically - also auto-created from Tenure History)",
+                  foreground="#666666").pack(side="left", padx=10)
+
+        cols = [
+            ("oid", "ID", 60, "center"),
+            ("name", "Organization Name", 340, "w"),
+            ("tenures", "Tenures Linked", 130, "center"),
+            ("assigns", "Assignments Linked", 150, "center"),
+        ]
+        frame, self.tree_orgs = _make_tree(tab, cols)
+        frame.grid(row=1, column=0, sticky="nsew")
+        # double-click to rename? reuse add
+        self.tree_orgs.bind("<Double-1>", lambda e: self._edit_organization_dialog())
+
+    def refresh_organizations(self):
+        rows = db.list_organizations()
+        self.tree_orgs.delete(*self.tree_orgs.get_children())
+        for o in rows:
+            self.tree_orgs.insert("", "end", iid=str(o["id"]), values=(
+                o["id"], o["name"], o["tenures_used"], o["assignments_used"],
+            ))
+
+    def add_organization(self):
+        name = " ".join(self.var_new_org.get().split())
+        if not name:
+            messagebox.showinfo("Empty name", "Enter an organization name first.", parent=self)
+            return
+        existing = {o["name"].lower() for o in db.list_organizations()}
+        oid = db.ensure_organization(name)
+        self.var_new_org.set("")
+        if name.lower() in existing:
+            self.set_status(f'Organization "{name}" already exists - existing entry reused.')
+        else:
+            self.set_status(f'Organization "{name}" added.')
+        self.refresh_all()
+        if oid is not None:
+            try:
+                self.tree_orgs.selection_set(str(oid))
+                self.nb.select(self.tab_orgs)
+            except Exception:
+                pass
+
+    def delete_organization(self):
+        sel = self.tree_orgs.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select an organization first.", parent=self)
+            return
+        oid = int(sel[0])
+        row = next((o for o in db.list_organizations() if o["id"] == oid), None)
+        label = row["name"] if row else f"#{oid}"
+        if messagebox.askyesno(
+            "Confirm delete",
+            f'Delete collaborator organization "{label}"?\nLinked tenure/assignment records will keep but lose the link.',
+            parent=self,
+        ):
+            db.delete_organization(oid)
+            self.set_status("Organization deleted.")
+            self.refresh_all()
+
+    def _edit_organization_dialog(self):
+        sel = self.tree_orgs.selection()
+        if not sel:
+            return
+        oid = int(sel[0])
+        row = next((o for o in db.list_organizations() if o["id"] == oid), None)
+        if not row:
+            return
+        new_name = tk.simpledialog.askstring("Rename Organization", f"New name for \"{row['name']}\":", parent=self)
+        if new_name is None:
+            return
+        new_name = " ".join(new_name.split())
+        if not new_name:
+            messagebox.showinfo("Empty name", "Name cannot be empty.", parent=self)
+            return
+        if new_name.lower() == row["name"].lower():
+            return
+        # check duplicate
+        if any(o["name"].lower() == new_name.lower() for o in db.list_organizations()):
+            messagebox.showerror("Duplicate", f'An organization named \"{new_name}\" already exists.', parent=self)
+            return
+        # simple direct SQL rename (no helper yet)
+        import sqlite3
+        from contextlib import closing
+        with closing(db._connect()) as conn, conn:
+            conn.execute("UPDATE organizations SET name = ? WHERE id = ?", (new_name, oid))
+        self.set_status(f'Organization renamed to \"{new_name}\".')
+        self.refresh_all()
+
     def refresh_projects(self):
         rows = db.list_projects()
         self.tree_projects.delete(*self.tree_projects.get_children())
@@ -571,6 +1204,130 @@ class App(tk.Tk):
         ):
             db.delete_project(pid)
             self.set_status(f"Project deleted.")
+            self.refresh_all()
+
+    # ── Tenure History ───────────────────────────────────────
+    def refresh_tenure_filters(self):
+        prev = self.tenure_emp_var.get()
+        choices = ["All employees"] + [f"{r['emp_id']} - {r['name']}" for r in db.get_employees()]
+        self.cmb_tenure_emp["values"] = choices
+        if prev not in choices:
+            self.tenure_emp_var.set("All employees")
+
+    def refresh_tenures(self):
+        emp_disp = self.tenure_emp_var.get()
+        emp_id = None
+        if emp_disp and not emp_disp.startswith("All"):
+            emp_id = emp_disp.split(" - ")[0].strip()
+        ttype = self.tenure_type_var.get()
+        rows = db.list_tenures(emp_id=emp_id, tenure_type=None if ttype == "All" else ttype)
+        self.tree_tenure.delete(*self.tree_tenure.get_children())
+        today = datetime.date.today().isoformat()
+        for r in rows:
+            end = r["release_date"] or today
+            try:
+                days = (datetime.date.fromisoformat(end) - datetime.date.fromisoformat(r["join_date"])).days + 1
+                dur = db._format_duration(days) if hasattr(db, "_format_duration") else f"{days}d"
+            except Exception:
+                dur = ""
+            release_disp = r["release_date"] or "Ongoing"
+            self.tree_tenure.insert("", "end", iid=str(r["id"]), values=(
+                r["id"], r["emp_id"], r["emp_name"], r["join_date"], release_disp,
+                r["tenure_type"], r["project_name"] or "", r["organization_name"] or "",
+                r["role"] or "", dur,
+            ))
+
+    def refresh_tenure_summary(self):
+        rows = db.tenure_summary_all()
+        self.tree_tenure_summary.delete(*self.tree_tenure_summary.get_children())
+        for s in rows:
+            last_rel = s["last_release"] or "Ongoing"
+            status = "Active" if s["is_currently_active"] else "Released"
+            first = s["first_join"] or "-"
+            total = s["total_formatted"] if s["interval_count"] else "-"
+            self.tree_tenure_summary.insert("", "end", iid=s["emp_id"], values=(
+                s["emp_id"], s["name"], s["interval_count"], total, first, last_rel, status,
+            ))
+
+    def _on_tenure_select(self):
+        sel = self.tree_tenure.selection()
+        if not sel:
+            return
+        tid = int(sel[0])
+        row = db.get_tenure(tid)
+        if not row:
+            return
+        # Show detail for this employee
+        self._show_tenure_detail(row["emp_id"])
+
+    def _on_summary_select(self):
+        sel = self.tree_tenure_summary.selection()
+        if not sel:
+            return
+        emp_id = sel[0]
+        self._show_tenure_detail(emp_id)
+        # also filter top combo to that employee for convenience
+        # self.tenure_emp_var.set(next((v for v in self.cmb_tenure_emp["values"] if v.startswith(emp_id)), "All employees"))
+        # self.refresh_tenures()
+
+    def _show_tenure_detail(self, emp_id):
+        info = db.tenure_summary_for_employee(emp_id)
+        if info["interval_count"] == 0:
+            self.tenure_detail_var.set(f"{emp_id}: no tenure records yet.")
+            self.tree_tenure_detail.delete(*self.tree_tenure_detail.get_children())
+            return
+        total = info["total_formatted"]
+        status = "Active (still working)" if info["is_currently_active"] else f"Released on {info['last_release']}"
+        self.tenure_detail_var.set(
+            f"{emp_id} - {info['intervals'][0]['emp_name']}: {info['interval_count']} period(s), "
+            f"total {total} ({info['total_days']} days), {status}. First join: {info['first_join']}"
+        )
+        self.tree_tenure_detail.delete(*self.tree_tenure_detail.get_children())
+        for iv in sorted(info["intervals"], key=lambda x: x["join_date"]):
+            rel = iv["release_date"] or "Ongoing"
+            dur = iv.get("duration_formatted", "")
+            self.tree_tenure_detail.insert("", "end", values=(
+                iv["join_date"], rel, iv["tenure_type"], iv["project_name"] or "", iv["role"] or "", dur,
+            ))
+
+    def refresh_tenure_tab(self):
+        self.refresh_tenure_filters()
+        self.refresh_tenures()
+        self.refresh_tenure_summary()
+
+    def add_tenure(self):
+        dlg = TenureDialog(self)
+        self.wait_window(dlg)
+        if dlg.saved:
+            self.set_status("Tenure record added.")
+            self.refresh_all()
+
+    def edit_tenure(self):
+        sel = self.tree_tenure.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a tenure record first.", parent=self)
+            return
+        rec = db.get_tenure(int(sel[0]))
+        if not rec:
+            messagebox.showerror("Not found", "This tenure record no longer exists.", parent=self)
+            return
+        dlg = TenureDialog(self, rec)
+        self.wait_window(dlg)
+        if dlg.saved:
+            self.set_status(f"Tenure #{rec['id']} updated.")
+            self.refresh_all()
+
+    def delete_tenure(self):
+        sel = self.tree_tenure.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a tenure record first.", parent=self)
+            return
+        tid = int(sel[0])
+        rec = db.get_tenure(tid)
+        label = f"{rec['emp_name']} ({rec['emp_id']}) {rec['join_date']} -> {rec['release_date'] or 'Ongoing'}" if rec else f"#{tid}"
+        if messagebox.askyesno("Confirm delete", f"Delete tenure record:\n{label}?", parent=self):
+            db.delete_tenure(tid)
+            self.set_status(f"Tenure #{tid} deleted.")
             self.refresh_all()
 
     def refresh_visits_filters(self):
@@ -803,6 +1560,61 @@ class App(tk.Tk):
             try:
                 os.startfile(path)
                 self.set_status("Opened report PDF - use your PDF viewer's Print option.")
+            except OSError as exc:
+                messagebox.showerror("Print failed", str(exc), parent=self)
+
+    # ── Tenure Report Exports ───────────────────────────────
+    def _save_tenure_report(self, ext, filetype, fn):
+        today = datetime.date.today().isoformat()
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            defaultextension=ext,
+            initialfile=f"tenure_report_{today}{ext}",
+            filetypes=[filetype, ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            fn(path)
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc), parent=self)
+            return
+        self.set_status(f"Tenure report exported: {path}")
+        if messagebox.askyesno("Export complete", "Open the exported report now?", parent=self):
+            try:
+                os.startfile(path)
+            except OSError as exc:
+                messagebox.showerror("Cannot open file", str(exc), parent=self)
+
+    def export_tenure_csv(self):
+        self._save_tenure_report(".csv", ("CSV file", "*.csv"), reporting.export_tenure_csv)
+
+    def export_tenure_excel(self):
+        self._save_tenure_report(".xlsx", ("Excel workbook", "*.xlsx"), reporting.export_tenure_xlsx)
+
+    def export_tenure_pdf(self):
+        self._save_tenure_report(".pdf", ("PDF file", "*.pdf"), reporting.export_tenure_pdf)
+
+    def print_tenure(self):
+        today = datetime.date.today().isoformat()
+        path = os.path.join(tempfile.gettempdir(), f"tenure_report_{today}.pdf")
+        try:
+            reporting.export_tenure_pdf(path)
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc), parent=self)
+            return
+        sent = False
+        if hasattr(os, "startfile"):
+            try:
+                os.startfile(path, "print")
+                sent = True
+                self.set_status(f"Tenure report sent to printer (PDF: {path}).")
+            except OSError:
+                pass
+        if not sent:
+            try:
+                os.startfile(path)
+                self.set_status("Opened tenure report PDF - use your PDF viewer's Print option.")
             except OSError as exc:
                 messagebox.showerror("Print failed", str(exc), parent=self)
 
