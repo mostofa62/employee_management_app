@@ -67,6 +67,41 @@ python main.py
 - After login, header shows user/role. **Admin** sees **Manage Users** to add/delete users and reset passwords (optionally sync to Supabase).
 - Logout clears `is_logged_in` in DB; close window respects Stay logged in.
 
+## Environment - Turso Sync (Optional, Recommended for Cloud Backup at turso.tech)
+
+Every write (add/edit/delete employee, visit, tenure, project, org) is auto-synced to Turso when network is available. Offline writes are queued and retried.
+
+1. Create a Turso DB: https://turso.tech -> `turso db create employee-visits` (or via dashboard)
+2. Get credentials:
+   ```powershell
+   turso db show employee-visits --url        # -> libsql://employee-visits-xxx.turso.io
+   turso db tokens create employee-visits     # -> eyJ...
+   ```
+3. Configure in app (Admin only): open **Turso Sync** button in header (or Manage Users -> Turso Sync) and paste:
+   - **TURSO_DATABASE_URL** = `libsql://employee-visits-xxx.turso.io`  (or `https://...`)
+   - **TURSO_AUTH_TOKEN** = token from step 2
+   - Enable toggle. Click **Save** then **Test Connection** / **Sync Now**.
+
+   Or set via env before running (fallback, dev only - compiled builds need DB config):
+   ```powershell
+   $env:TURSO_DATABASE_URL="libsql://employee-visits-xxx.turso.io"
+   $env:TURSO_AUTH_TOKEN="eyJ..."
+   # or .env
+   TURSO_DATABASE_URL=libsql://...
+   TURSO_AUTH_TOKEN=eyJ...
+   ```
+   DB values (app_state) take priority over env for compiled builds.
+
+4. Status is shown in the bottom-right status bar: `Turso: synced ...` / `pending sync...` / `offline - queued` / `not configured`. Click it to open config.
+
+Sync details:
+- Local `employees.db` stays the primary (offline-first). Remote is a mirror.
+- On each mutation `db.py` calls `turso_sync.schedule_sync()` (debounced 2s, background thread). If offline, `pending` is stored and retried every 60s + on next launch.
+- Push uses Hrana HTTP `/v2/pipeline` (no native `libsql` required). If `libsql` is installed, it could also use embedded replica path. Full snapshot (DELETE + INSERT) handles deletions, batched 60 rows/request.
+- Requires `requests` (already used for Supabase). Works without `libsql`.
+
+To disable: Admin -> Turso Sync -> uncheck "Enable auto sync" -> Save.
+
 ## Database
 
 SQLite file `employees.db` (or `EMPLOYEE_VISITS_DB` env). Tables: `employees`, `visits`, `projects`, `organizations`, `employee_tenures`, plus auth tables `app_users` (hashed passwords via PBKDF2) and `app_state`.

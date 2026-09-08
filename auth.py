@@ -869,6 +869,7 @@ class ManageUsersDialog(tk.Toplevel):
         ttk.Button(top, text="Reset Password", command=self._reset_pw).pack(side="left", padx=4)
         ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(top, text="Supabase Config", command=self._supabase_config).pack(side="left", padx=4)
+        ttk.Button(top, text="Turso Sync", command=self._turso_config).pack(side="left", padx=4)
         ttk.Button(top, text="Close", command=self.destroy).pack(side="right")
 
         cols = [("id","ID",50,"center"),("name","Name",140,"w"),("phone","Mobile",130,"w"),("email","Email",180,"w"),("role","Role",70,"center"),("status","Status",70,"center")]
@@ -962,6 +963,14 @@ class ManageUsersDialog(tk.Toplevel):
     def _supabase_config(self):
         dlg = SupabaseConfigDialog(self)
         self.wait_window(dlg)
+
+    def _turso_config(self):
+        try:
+            import turso_sync  # type: ignore
+            dlg = turso_sync.TursoConfigDialog(self)
+            self.wait_window(dlg)
+        except Exception as exc:
+            messagebox.showerror("Turso", f"Failed to open Turso config: {exc}", parent=self)
 
 
 class SupabaseConfigDialog(tk.Toplevel):
