@@ -1,8 +1,10 @@
 import hashlib
+import json
 import os
 import re
 import secrets
 import sqlite3
+import threading
 from contextlib import closing
 from datetime import date, datetime
 from pathlib import Path
@@ -99,6 +101,19 @@ CREATE TABLE IF NOT EXISTS app_state (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS sync_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    table_name TEXT NOT NULL,
+    record_id  TEXT NOT NULL,
+    operation  TEXT NOT NULL CHECK (operation IN ('INSERT','UPDATE','DELETE')),
+    payload    TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    synced     INTEGER NOT NULL DEFAULT 0,
+    error      TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sync_log_synced ON sync_log (synced, created_at);
 """
 
 
@@ -161,6 +176,18 @@ def _migrate(conn):
             key   TEXT PRIMARY KEY,
             value TEXT
         );
+        CREATE TABLE IF NOT EXISTS sync_log (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_name TEXT NOT NULL,
+            record_id  TEXT NOT NULL,
+            operation  TEXT NOT NULL CHECK (operation IN ('INSERT','UPDATE','DELETE')),
+            payload    TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            synced     INTEGER NOT NULL DEFAULT 0,
+            error      TEXT,
+            retry_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_log_synced ON sync_log (synced, created_at);
     """)
     # ensure app_users columns for old installs
     try:
@@ -176,9 +203,29 @@ def _migrate(conn):
 
 
 def _connect():
-    conn = sqlite3.connect(str(DB_PATH))
+    # WAL + busy_timeout + synchronous NORMAL keeps UI responsive when background sync runs
+    # check_same_thread False allows use from any thread (Tk + sync worker)
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=2.0, check_same_thread=False, isolation_level=None)
+    except TypeError:
+        conn = sqlite3.connect(str(DB_PATH), timeout=2.0)
+    try:
+        conn.execute("PRAGMA busy_timeout=2000")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+    except Exception:
+        pass
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -186,6 +233,13 @@ def init_db():
     with closing(_connect()) as conn, conn:
         conn.executescript(_SCHEMA)
         _migrate(conn)
+        # First-time create: ensure WAL mode and checkpoint so file is self-contained
+        # (required for Turso file upload / embedded replica and safe offline backup)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
     # Auto-seed Supabase keys from env/.env into DB config table if DB is empty
     # (helps first-run and avoids manual re-entry; compiled builds then have keys)
     try:
@@ -222,22 +276,30 @@ def init_db():
 EMPLOYEE_TYPES = ("Government", "Non-Government")
 
 
-def ensure_project(name):
+def ensure_project(name, _do_sync=True):
+    """Ensure project exists, return id. Sync only on final save when _do_sync True."""
     text = " ".join((name or "").split())
     if not text:
         return None
-    with closing(_connect()) as conn, conn:
+    with closing(_connect()) as conn:
         row = conn.execute("SELECT id FROM projects WHERE name = ?", (text,)).fetchone()
         if row:
             return row["id"]
+    inserted = False
+    with closing(_connect()) as conn, conn:
         try:
             cur = conn.execute("INSERT INTO projects (name) VALUES (?)", (text,))
-            return cur.lastrowid
+            row_id = cur.lastrowid
+            inserted = True
         except sqlite3.IntegrityError:
             row = conn.execute("SELECT id FROM projects WHERE name = ?", (text,)).fetchone()
             if not row:
                 raise
-            return row["id"]
+            row_id = row["id"]
+            inserted = False
+    if inserted and _do_sync:
+        _log_sync('projects', row_id, 'INSERT', {'name': text})
+    return row_id
 
 
 def list_projects():
@@ -258,6 +320,7 @@ def delete_project(project_id):
             raise ValueError("This project no longer exists.")
         conn.execute("UPDATE employees SET project_id = NULL WHERE project_id = ?", (project_id,))
         conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    _log_sync('projects', project_id, 'DELETE')
 
 
 def _clean_employee(emp_id, name, designation, phone_primary, phone_secondary, email, max_visits, emp_type):
@@ -299,7 +362,7 @@ def _clean_employee(emp_id, name, designation, phone_primary, phone_secondary, e
 def add_employee(emp_id, name, designation, phone_primary="", phone_secondary="", email="", max_visits=2,
                  emp_type="Government", project=None):
     data = _clean_employee(emp_id, name, designation, phone_primary, phone_secondary, email, max_visits, emp_type)
-    project_id = ensure_project(project)
+    project_id = ensure_project(project, _do_sync=False)
     with closing(_connect()) as conn, conn:
         try:
             conn.execute(
@@ -311,12 +374,13 @@ def add_employee(emp_id, name, designation, phone_primary="", phone_secondary=""
             )
         except sqlite3.IntegrityError:
             raise ValueError(f"Employee ID '{data['emp_id']}' already exists.")
+    _log_sync('employees', data['emp_id'], 'INSERT', data)
 
 
 def update_employee(original_emp_id, emp_id, name, designation, phone_primary="", phone_secondary="",
                     email="", max_visits=2, emp_type="Government", project=None):
     data = _clean_employee(emp_id, name, designation, phone_primary, phone_secondary, email, max_visits, emp_type)
-    project_id = ensure_project(project)
+    project_id = ensure_project(project, _do_sync=False)
     with closing(_connect()) as conn, conn:
         exists = conn.execute("SELECT 1 FROM employees WHERE emp_id = ?", (original_emp_id,)).fetchone()
         if not exists:
@@ -334,11 +398,13 @@ def update_employee(original_emp_id, emp_id, name, designation, phone_primary=""
                WHERE emp_id = ?""",
             tuple(data.values()) + (project_id, original_emp_id),
         )
+    _log_sync('employees', data['emp_id'], 'UPDATE', data)
 
 
 def delete_employee(emp_id):
     with closing(_connect()) as conn, conn:
         conn.execute("DELETE FROM employees WHERE emp_id = ?", (emp_id,))
+    _log_sync('employees', emp_id, 'DELETE')
 
 
 def get_employees(search=""):
@@ -436,7 +502,9 @@ def add_visit(emp_id, country, purpose_title, purpose_detail, visit_date):
                VALUES (?, ?, ?, ?, ?)""",
             (emp_id, country, purpose_title, purpose_detail, visit_date),
         )
-        return cur.lastrowid
+        row_id = cur.lastrowid
+    _log_sync('visits', row_id, 'INSERT', {'emp_id': emp_id, 'country': country, 'visit_date': visit_date})
+    return row_id
 
 
 def update_visit(visit_id, emp_id, country, purpose_title, purpose_detail, visit_date):
@@ -451,9 +519,10 @@ def update_visit(visit_id, emp_id, country, purpose_title, purpose_detail, visit
         conn.execute(
             """UPDATE visits
                SET emp_id = ?, country = ?, purpose_title = ?, purpose_detail = ?, visit_date = ?
-               WHERE id = ?""",
+                WHERE id = ?""",
             (emp_id, country, purpose_title, purpose_detail, visit_date, visit_id),
         )
+    _log_sync('visits', visit_id, 'UPDATE', {'emp_id': emp_id, 'country': country, 'visit_date': visit_date})
 
 
 def get_visit(visit_id):
@@ -469,6 +538,7 @@ def get_visit(visit_id):
 def delete_visit(visit_id):
     with closing(_connect()) as conn, conn:
         conn.execute("DELETE FROM visits WHERE id = ?", (visit_id,))
+    _log_sync('visits', visit_id, 'DELETE')
 
 
 def list_visits(year=None, emp_id=None):
@@ -523,22 +593,29 @@ def summary(year):
 
 # ── Organizations ──────────────────────────────────────────────
 
-def ensure_organization(name):
+def ensure_organization(name, _do_sync=True):
     text = " ".join((name or "").split())
     if not text:
         return None
-    with closing(_connect()) as conn, conn:
+    with closing(_connect()) as conn:
         row = conn.execute("SELECT id FROM organizations WHERE name = ?", (text,)).fetchone()
         if row:
             return row["id"]
+    inserted = False
+    with closing(_connect()) as conn, conn:
         try:
             cur = conn.execute("INSERT INTO organizations (name) VALUES (?)", (text,))
-            return cur.lastrowid
+            row_id = cur.lastrowid
+            inserted = True
         except sqlite3.IntegrityError:
             row = conn.execute("SELECT id FROM organizations WHERE name = ?", (text,)).fetchone()
             if not row:
                 raise
-            return row["id"]
+            row_id = row["id"]
+            inserted = False
+    if inserted and _do_sync:
+        _log_sync('organizations', row_id, 'INSERT', {'name': text})
+    return row_id
 
 
 def list_organizations():
@@ -560,6 +637,7 @@ def delete_organization(org_id):
         conn.execute("UPDATE employee_tenures SET organization_id = NULL WHERE organization_id = ?", (org_id,))
         conn.execute("UPDATE employee_assignments SET organization_id = NULL WHERE organization_id = ?", (org_id,))
         conn.execute("DELETE FROM organizations WHERE id = ?", (org_id,))
+    _log_sync('organizations', org_id, 'DELETE')
 
 
 # ── Tenure helpers ─────────────────────────────────────────────
@@ -638,21 +716,23 @@ def add_tenure(emp_id, join_date, release_date=None, tenure_type="Government",
         if not exists:
             raise ValueError(f"Employee '{emp_id}' does not exist.")
         _check_tenure_overlap(conn, emp_id, join_date, release_date)
-        project_id = ensure_project(project) if project else None
-        organization_id = ensure_organization(organization) if organization else None
+        project_id = ensure_project(project, _do_sync=False) if project else None
+        organization_id = ensure_organization(organization, _do_sync=False) if organization else None
         # Re-resolve IDs within same connection to avoid separate connection race;
         # ensure_* already commits, but get ids again via lookup to keep FK consistent
         if project and project_id is None:
-            project_id = ensure_project(project)
+            project_id = ensure_project(project, _do_sync=False)
         if organization and organization_id is None:
-            organization_id = ensure_organization(organization)
+            organization_id = ensure_organization(organization, _do_sync=False)
         cur = conn.execute(
             """INSERT INTO employee_tenures
                (emp_id, join_date, release_date, tenure_type, project_id, organization_id, role, notes)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (emp_id, join_date, release_date, tenure_type, project_id, organization_id, role, notes),
         )
-        return cur.lastrowid
+        row_id = cur.lastrowid
+    _log_sync('employee_tenures', row_id, 'INSERT', {'emp_id': emp_id, 'join_date': join_date})
+    return row_id
 
 
 def update_tenure(tenure_id, emp_id, join_date, release_date=None, tenure_type="Government",
@@ -682,20 +762,22 @@ def update_tenure(tenure_id, emp_id, join_date, release_date=None, tenure_type="
         if not emp_exists:
             raise ValueError(f"Employee '{emp_id}' does not exist.")
         _check_tenure_overlap(conn, emp_id, join_date, release_date, exclude_id=tenure_id)
-        project_id = ensure_project(project) if project else None
-        organization_id = ensure_organization(organization) if organization else None
+        project_id = ensure_project(project, _do_sync=False) if project else None
+        organization_id = ensure_organization(organization, _do_sync=False) if organization else None
         conn.execute(
             """UPDATE employee_tenures
                SET emp_id = ?, join_date = ?, release_date = ?, tenure_type = ?,
-                   project_id = ?, organization_id = ?, role = ?, notes = ?
-               WHERE id = ?""",
+                    project_id = ?, organization_id = ?, role = ?, notes = ?
+                WHERE id = ?""",
             (emp_id, join_date, release_date, tenure_type, project_id, organization_id, role, notes, tenure_id),
         )
+    _log_sync('employee_tenures', tenure_id, 'UPDATE', {'emp_id': emp_id, 'join_date': join_date})
 
 
 def delete_tenure(tenure_id):
     with closing(_connect()) as conn, conn:
         conn.execute("DELETE FROM employee_tenures WHERE id = ?", (tenure_id,))
+    _log_sync('employee_tenures', tenure_id, 'DELETE')
 
 
 def get_tenure(tenure_id):
@@ -905,15 +987,17 @@ def add_assignment(emp_id, start_date, end_date=None, project=None, organization
         if tenure_id is not None:
             if not conn.execute("SELECT 1 FROM employee_tenures WHERE id = ?", (tenure_id,)).fetchone():
                 raise ValueError("Linked tenure does not exist.")
-        project_id = ensure_project(project) if project else None
-        organization_id = ensure_organization(organization) if organization else None
+        project_id = ensure_project(project, _do_sync=False) if project else None
+        organization_id = ensure_organization(organization, _do_sync=False) if organization else None
         cur = conn.execute(
             """INSERT INTO employee_assignments
                (emp_id, tenure_id, project_id, organization_id, role, start_date, end_date, notes)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (emp_id, tenure_id, project_id, organization_id, role, start_date, end_date, notes),
         )
-        return cur.lastrowid
+        row_id = cur.lastrowid
+    _log_sync('employee_assignments', row_id, 'INSERT', {'emp_id': emp_id, 'start_date': start_date})
+    return row_id
 
 
 def update_assignment(assign_id, emp_id, start_date, end_date=None, project=None, organization=None,
@@ -927,19 +1011,21 @@ def update_assignment(assign_id, emp_id, start_date, end_date=None, project=None
             raise ValueError("This assignment no longer exists.")
         if not conn.execute("SELECT 1 FROM employees WHERE emp_id = ?", (emp_id,)).fetchone():
             raise ValueError(f"Employee '{emp_id}' does not exist.")
-        project_id = ensure_project(project) if project else None
-        organization_id = ensure_organization(organization) if organization else None
+        project_id = ensure_project(project, _do_sync=False) if project else None
+        organization_id = ensure_organization(organization, _do_sync=False) if organization else None
         conn.execute(
             """UPDATE employee_assignments
                SET emp_id=?, tenure_id=?, project_id=?, organization_id=?, role=?, start_date=?, end_date=?, notes=?
-               WHERE id=?""",
+                WHERE id=?""",
             (emp_id, tenure_id, project_id, organization_id, (role or "").strip(), start_date, end_date, (notes or "").strip(), assign_id),
         )
+    _log_sync('employee_assignments', assign_id, 'UPDATE', {'emp_id': emp_id, 'start_date': start_date})
 
 
 def delete_assignment(assign_id):
     with closing(_connect()) as conn, conn:
         conn.execute("DELETE FROM employee_assignments WHERE id = ?", (assign_id,))
+    _log_sync('employee_assignments', assign_id, 'DELETE')
 
 
 def list_assignments(emp_id=None, tenure_id=None):
@@ -1078,7 +1164,6 @@ def create_app_user(name, phone, email, password, role="admin"):
                 "INSERT INTO app_users (name, phone, email, password_hash, password_salt, role) VALUES (?,?,?,?,?,?)",
                 (name, phone, email, pwd_hash, salt, role),
             )
-            return cur.lastrowid
         except sqlite3.IntegrityError as exc:
             msg = str(exc).lower()
             if "phone" in msg:
@@ -1086,6 +1171,8 @@ def create_app_user(name, phone, email, password, role="admin"):
             if "email" in msg:
                 raise ValueError(f"Email '{email}' is already registered.")
             raise ValueError("Phone or email already registered.")
+    _log_sync('app_users', cur.lastrowid, 'INSERT', {'phone': phone, 'email': email})
+    return cur.lastrowid
 
 
 def verify_login(identifier, password):
@@ -1110,11 +1197,13 @@ def set_user_logged_in(user_id, logged_in=True):
             conn.execute("UPDATE app_users SET is_logged_in=1, last_login=datetime('now') WHERE id=?", (user_id,))
         else:
             conn.execute("UPDATE app_users SET is_logged_in=0 WHERE id=?", (user_id,))
+    _log_sync('app_users', user_id, 'UPDATE', {'is_logged_in': logged_in})
 
 
 def logout_all():
     with closing(_connect()) as conn, conn:
         conn.execute("UPDATE app_users SET is_logged_in=0")
+    _log_sync('app_users', 'all', 'UPDATE', {'is_logged_in': 0})
 
 
 def update_user_password_by_phone(phone, new_password):
@@ -1127,7 +1216,9 @@ def update_user_password_by_phone(phone, new_password):
         cur = conn.execute("UPDATE app_users SET password_hash=?, password_salt=? WHERE phone=?", (pwd_hash, salt, phone))
         if cur.rowcount == 0:
             raise ValueError(f"No local user found with mobile '{phone}'.")
-        return cur.rowcount
+        rowc = cur.rowcount
+    _log_sync('app_users', phone, 'UPDATE', {'password': 'reset'})
+    return rowc
 
 
 def update_user_password_by_id(user_id, new_password):
@@ -1137,11 +1228,14 @@ def update_user_password_by_id(user_id, new_password):
     pwd_hash, salt = _hash_password(pw)
     with closing(_connect()) as conn, conn:
         conn.execute("UPDATE app_users SET password_hash=?, password_salt=? WHERE id=?", (pwd_hash, salt, user_id))
+    _log_sync('app_users', user_id, 'UPDATE', {'password': 'reset'})
 
 
 def set_app_state(key, value):
     with closing(_connect()) as conn, conn:
         conn.execute("INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    if not str(key).startswith("turso_") and not str(key).startswith("sync_"):
+        _log_sync('app_state', key, 'UPDATE', {'key': key})
 
 
 def get_app_state(key, default=None):
@@ -1153,6 +1247,8 @@ def get_app_state(key, default=None):
 def delete_app_state(key):
     with closing(_connect()) as conn, conn:
         conn.execute("DELETE FROM app_state WHERE key=?", (key,))
+    if not str(key).startswith("turso_") and not str(key).startswith("sync_"):
+        _log_sync('app_state', key, 'DELETE')
 
 
 def get_stay_logged_in_user():
@@ -1179,11 +1275,13 @@ def set_stay_logged_in(user_id, enabled=True):
     else:
         delete_app_state("stay_logged_in")
         delete_app_state("stay_logged_in_user_id")
+    # already logged via set/delete_app_state, no extra sync
 
 
 def clear_stay_logged_in():
     delete_app_state("stay_logged_in")
     delete_app_state("stay_logged_in_user_id")
+    # already logged
 
 
 # ── App Config / Supabase Keys (persisted in DB for compiled builds) ──
@@ -1227,6 +1325,7 @@ def set_supabase_config(api_key=None, secret_key=None, url=None):
             set_app_state("supabase_url", v)
         else:
             delete_app_state("supabase_url")
+    # already logged via set/delete_app_state
     return get_supabase_config()
 
 
@@ -1240,3 +1339,83 @@ def is_supabase_configured():
     sec = (cfg["secret_key"] or sec_env).strip()
     # if only one is set, legacy mode allows single key for both headers
     return bool(api or sec)
+
+
+# ── Turso Sync log + trigger (non-blocking) ─────────────
+def _log_sync(table_name: str, record_id, operation: str, payload=None):
+    """Insert sync_log entry then trigger background sync. Never blocks UI.
+
+    - Local DB write is already committed before calling this.
+    - Log insert runs in background thread (1-2ms) so delete/add never hangs.
+    - payload optional, sync_log itself excluded from logging to avoid loop.
+    """
+    def _do_log():
+        try:
+            with closing(_connect()) as conn, conn:
+                try:
+                    p = json.dumps(payload, ensure_ascii=False) if payload is not None else None
+                except Exception:
+                    p = str(payload) if payload is not None else None
+                conn.execute(
+                    "INSERT INTO sync_log (table_name, record_id, operation, payload) VALUES (?,?,?,?)",
+                    (str(table_name), str(record_id), str(operation), p),
+                )
+        except Exception:
+            pass
+        try:
+            import turso_sync  # type: ignore
+            turso_sync.schedule_sync()
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=_do_log, daemon=True).start()
+    except Exception:
+        # fallback sync without log
+        try:
+            import turso_sync
+            turso_sync.schedule_sync()
+        except Exception:
+            pass
+
+def _trigger_turso_sync():
+    """Legacy generic trigger: log generic event and schedule background sync."""
+    def _do():
+        try:
+            with closing(_connect()) as conn, conn:
+                conn.execute(
+                    "INSERT INTO sync_log (table_name, record_id, operation) VALUES (?,?,?)",
+                    ("mixed", "0", "UPDATE"),
+                )
+        except Exception:
+            pass
+        try:
+            import turso_sync  # type: ignore
+            turso_sync.schedule_sync()
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=_do, daemon=True).start()
+    except Exception:
+        try:
+            import turso_sync
+            turso_sync.schedule_sync()
+        except Exception:
+            pass
+
+def get_sync_log_pending_count():
+    try:
+        with closing(_connect()) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM sync_log WHERE synced=0").fetchone()
+            return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+def get_sync_log_recent(limit=20):
+    try:
+        with closing(_connect()) as conn:
+            return conn.execute(
+                "SELECT id, table_name, record_id, operation, created_at, synced, error FROM sync_log ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+    except Exception:
+        return []

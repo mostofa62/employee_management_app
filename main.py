@@ -9,6 +9,12 @@ import db
 import auth
 import reporting
 from countries import COUNTRIES
+try:
+    import turso_sync  # type: ignore
+    _HAS_TURSO = True
+except Exception:
+    turso_sync = None  # type: ignore
+    _HAS_TURSO = False
 
 DATE_HINT = "YYYY-MM-DD"
 
@@ -681,6 +687,12 @@ class App(tk.Tk):
         style.configure("TCombobox", font=("Segoe UI", 11))
 
         db.init_db()
+        # Init Turso sync (background, on each update when network available)
+        if _HAS_TURSO and turso_sync is not None:
+            try:
+                turso_sync.init_turso()
+            except Exception:
+                pass
         # Ensure current_user is fresh from DB (stay-logged-in path)
         if self.current_user is not None:
             try:
@@ -747,6 +759,12 @@ class App(tk.Tk):
             if urole == "admin":
                 ttk.Button(btn_box, text="Admin Setup", width=12, command=self.open_admin_setup).pack(side="left", padx=2)
                 ttk.Button(btn_box, text="Manage Users", width=13, command=self.open_manage_users).pack(side="left", padx=2)
+                if _HAS_TURSO:
+                    ttk.Button(btn_box, text="Turso Sync", width=12, command=self.open_turso_setup).pack(side="left", padx=2)
+            else:
+                if _HAS_TURSO:
+                    # non-admin can view sync status (read-only)
+                    ttk.Button(btn_box, text="Sync Status", width=12, command=self.open_turso_setup).pack(side="left", padx=2)
             ttk.Button(btn_box, text="Logout", width=10, command=self.logout).pack(side="left", padx=2)
         else:
             # No user (should not happen after auth gate) - show login button
@@ -768,9 +786,29 @@ class App(tk.Tk):
             anchor="center"
         ).pack(fill="x")
 
-        # Status Bar
+        # Status Bar + Turso sync indicator (non-blocking, with busy progress)
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w", padding=(8, 4), font=("Segoe UI", 10)).pack(fill="x", side="bottom")
+        self.turso_status_var = tk.StringVar(value="")
+        status_frame = ttk.Frame(self)
+        status_frame.pack(fill="x", side="bottom")
+        ttk.Label(status_frame, textvariable=self.status_var, relief="sunken", anchor="w", padding=(8, 4), font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
+        if _HAS_TURSO:
+            # container for turso label + busy progress
+            turso_box = ttk.Frame(status_frame, relief="sunken", padding=(2,2))
+            turso_box.pack(side="right", fill="y")
+            self.lbl_turso = ttk.Label(turso_box, textvariable=self.turso_status_var, anchor="w", padding=(6, 4), font=("Segoe UI", 9), foreground="#006633", width=32)
+            self.lbl_turso.pack(side="left", fill="y")
+            self.lbl_turso.bind("<Button-1>", lambda e: self.open_turso_setup())
+            self.turso_progress = ttk.Progressbar(turso_box, mode="indeterminate", length=90)
+            # hidden initially; packed when syncing
+            self._turso_progress_visible = False
+            # register callback so bg thread can trigger UI update via after
+            try:
+                turso_sync.set_status_callback(lambda st: self.after(0, self._refresh_turso_status))
+            except Exception:
+                pass
+            self._refresh_turso_status()
+            self.after(4000, self._poll_turso_status)
 
         # Main Notebook
         self.nb = ttk.Notebook(self)
@@ -1673,6 +1711,122 @@ class App(tk.Tk):
         # alias for backward compat / quick access
         return self.open_admin_setup()
 
+    def open_turso_setup(self):
+        """Turso Sync config - save DB to turso.tech on each update when network available."""
+        if not _HAS_TURSO or turso_sync is None:
+            messagebox.showerror("Not available", "Turso sync module not found.", parent=self)
+            return
+        # admin required to change config, but non-admin can view status
+        if self.current_user and self.current_user["role"] != "admin":
+            # read-only view - still allow dialog but save will be blocked by enabled check? allow open
+            # let them see status, but admin change will be warned inside dialog
+            pass
+        elif not self.current_user or self.current_user["role"] != "admin":
+            messagebox.showerror("Access denied", "Only admin can configure Turso Sync.", parent=self)
+            return
+        dlg = turso_sync.TursoConfigDialog(self)  # type: ignore
+        self.wait_window(dlg)
+        if getattr(dlg, "saved", False):
+            self.set_status("Turso config saved. Sync enabled on network available.")
+            self._refresh_turso_status()
+            # trigger immediate sync if configured
+            try:
+                if turso_sync.is_turso_configured():
+                    self.set_status("Turso syncing...")
+                    turso_sync.schedule_sync(delay=1.0)
+            except Exception:
+                pass
+
+    def _refresh_turso_status(self):
+        if not _HAS_TURSO or turso_sync is None:
+            return
+        try:
+            # quick, non-blocking - never hangs UI (no live socket on UI thread)
+            st = turso_sync.get_status(check_network=False)
+            syncing = st.get("syncing") == "True"
+            log_pending = int(st.get("log_pending","0") or 0)
+            # busy progress handling - shows in footer that background sync is active
+            try:
+                if syncing or st.get("last_status") == "syncing":
+                    if not self._turso_progress_visible:
+                        self.turso_progress.pack(side="left", padx=(4,0), pady=2)
+                        self.turso_progress.start(10)
+                        self._turso_progress_visible = True
+                    if log_pending > 0:
+                        self.turso_status_var.set(f"Turso: syncing... ({log_pending} pending)")
+                    else:
+                        self.turso_status_var.set("Turso: syncing...")
+                    try: self.lbl_turso.configure(foreground="#006633")
+                    except Exception: pass
+                    return
+                else:
+                    if self._turso_progress_visible:
+                        try:
+                            self.turso_progress.stop()
+                            self.turso_progress.pack_forget()
+                        except Exception:
+                            pass
+                        self._turso_progress_visible = False
+            except Exception:
+                pass
+
+            if not st["url"] and not st["configured"] == "True":
+                self.turso_status_var.set("Turso: not configured")
+                try: self.lbl_turso.configure(foreground="#cc7700")
+                except Exception: pass
+            elif st["last_status"] == "pending":
+                if log_pending > 0:
+                    self.turso_status_var.set(f"Turso: pending sync... ({log_pending})")
+                else:
+                    self.turso_status_var.set("Turso: pending sync...")
+                try: self.lbl_turso.configure(foreground="#cc7700")
+                except Exception: pass
+            elif st["last_status"] == "offline":
+                if log_pending > 0:
+                    self.turso_status_var.set(f"Turso: offline - queued ({log_pending})")
+                else:
+                    self.turso_status_var.set("Turso: offline - queued")
+                try: self.lbl_turso.configure(foreground="#cc7700")
+                except Exception: pass
+            elif st["last_status"] == "syncing":
+                self.turso_status_var.set("Turso: syncing...")
+                try: self.lbl_turso.configure(foreground="#006633")
+                except Exception: pass
+            elif st["last_status"] == "ok":
+                when = st["last_sync"][:16] if st["last_sync"] else "now"
+                # show failed retry info if any
+                if st.get("last_error"):
+                    err = st["last_error"][:20].replace("\n"," ").strip()
+                    self.turso_status_var.set(f"Turso: synced {when} (next retry if failed)")
+                else:
+                    self.turso_status_var.set(f"Turso: synced {when}")
+                try: self.lbl_turso.configure(foreground="#006633")
+                except Exception: pass
+            elif st["last_status"] == "error":
+                err = st["last_error"][:26] if st["last_error"] else "error"
+                err = err.replace("\n"," ").strip()
+                # standard retry interval 60s
+                self.turso_status_var.set(f"Turso: error - {err} (retry 60s)")
+                try: self.lbl_turso.configure(foreground="#cc0000")
+                except Exception: pass
+            else:
+                net = st.get("network","unknown")
+                self.turso_status_var.set(f"Turso: {net}")
+                try: self.lbl_turso.configure(foreground="#555")
+                except Exception: pass
+        except Exception:
+            pass
+
+    def _poll_turso_status(self):
+        try:
+            self._refresh_turso_status()
+        except Exception:
+            pass
+        try:
+            self.after(4000, self._poll_turso_status)
+        except Exception:
+            pass
+
     def open_manage_users(self):
         if not self.current_user or self.current_user["role"] != "admin":
             messagebox.showerror("Access denied", "Only admin can manage users.", parent=self)
@@ -1713,6 +1867,14 @@ class App(tk.Tk):
         _run_app_with_auth()
 
     def _on_close(self):
+        try:
+            if _HAS_TURSO and turso_sync is not None:
+                try:
+                    turso_sync.stop_turso()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             if self.current_user:
                 db.set_user_logged_in(self.current_user["id"], False)
