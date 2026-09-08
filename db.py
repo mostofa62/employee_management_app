@@ -1,4 +1,7 @@
+import hashlib
 import os
+import re
+import secrets
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime
@@ -77,6 +80,25 @@ CREATE TABLE IF NOT EXISTS employee_assignments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_assign_emp_start ON employee_assignments (emp_id, start_date);
+
+CREATE TABLE IF NOT EXISTS app_users (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL,
+    phone          TEXT NOT NULL UNIQUE,
+    email          TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash  TEXT NOT NULL,
+    password_salt  TEXT NOT NULL,
+    role           TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('admin','user')),
+    is_active      INTEGER NOT NULL DEFAULT 1,
+    is_logged_in   INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    last_login     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS app_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 
@@ -122,7 +144,35 @@ def _migrate(conn):
             CHECK (end_date IS NULL OR end_date >= start_date)
         );
         CREATE INDEX IF NOT EXISTS idx_assign_emp_start ON employee_assignments (emp_id, start_date);
+        CREATE TABLE IF NOT EXISTS app_users (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            name           TEXT NOT NULL,
+            phone          TEXT NOT NULL UNIQUE,
+            email          TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            password_hash  TEXT NOT NULL,
+            password_salt  TEXT NOT NULL,
+            role           TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('admin','user')),
+            is_active      INTEGER NOT NULL DEFAULT 1,
+            is_logged_in   INTEGER NOT NULL DEFAULT 0,
+            created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+            last_login     TEXT
+        );
+        CREATE TABLE IF NOT EXISTS app_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
     """)
+    # ensure app_users columns for old installs
+    try:
+        ucols = {r[1] for r in conn.execute("PRAGMA table_info(app_users)")}
+        if "is_logged_in" not in ucols:
+            conn.execute("ALTER TABLE app_users ADD COLUMN is_logged_in INTEGER NOT NULL DEFAULT 0")
+        if "role" not in ucols:
+            conn.execute("ALTER TABLE app_users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
+        if "is_active" not in ucols:
+            conn.execute("ALTER TABLE app_users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+    except Exception:
+        pass
 
 
 def _connect():
@@ -136,6 +186,37 @@ def init_db():
     with closing(_connect()) as conn, conn:
         conn.executescript(_SCHEMA)
         _migrate(conn)
+    # Auto-seed Supabase keys from env/.env into DB config table if DB is empty
+    # (helps first-run and avoids manual re-entry; compiled builds then have keys)
+    try:
+        cfg = get_supabase_config()
+        if not (cfg.get("api_key") or "").strip() and not (cfg.get("secret_key") or "").strip():
+            env_api = (os.environ.get("SUPABASE_API_KEY") or os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_KEY") or "").strip()
+            env_sec = (os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+            # also try .env file directly (covers compiled build where python-dotenv may not have loaded yet)
+            if not env_api or not env_sec:
+                try:
+                    base = Path(__file__).resolve().with_name(".env")
+                    if base.is_file():
+                        for line in base.read_text(encoding="utf-8", errors="ignore").splitlines():
+                            line=line.strip()
+                            if not line or line.startswith("#") or "=" not in line:
+                                continue
+                            k,v=line.split("=",1)
+                            k=k.strip(); v=v.strip().strip('"').strip("'")
+                            if k=="SUPABASE_API_KEY" and not env_api and v:
+                                env_api=v
+                            elif k=="SUPABASE_SECRET_KEY" and not env_sec and v:
+                                env_sec=v
+                except Exception:
+                    pass
+            if env_api or env_sec:
+                if env_api:
+                    set_app_state("supabase_api_key", env_api)
+                if env_sec:
+                    set_app_state("supabase_secret_key", env_sec)
+    except Exception:
+        pass
 
 
 EMPLOYEE_TYPES = ("Government", "Non-Government")
@@ -892,3 +973,270 @@ def get_assignment(assign_id):
                WHERE a.id = ?""",
             (assign_id,),
         ).fetchone()
+
+
+# ── Auth / Login ─────────────────────────────────────────────
+
+def _hash_password(password, salt_hex=None):
+    if salt_hex is None:
+        salt = secrets.token_bytes(16)
+        salt_hex = salt.hex()
+    else:
+        salt = bytes.fromhex(salt_hex)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return dk.hex(), salt_hex
+
+
+def _verify_password(password, stored_hash, stored_salt):
+    calc, _ = _hash_password(password, stored_salt)
+    return secrets.compare_digest(calc, stored_hash)
+
+
+def _validate_phone(phone):
+    p = (phone or "").strip()
+    if not p:
+        raise ValueError("Phone / mobile number is required.")
+    # allow digits, +, -, spaces removed for strict check
+    digits = re.sub(r"\D", "", p)
+    if len(digits) < 8 or len(digits) > 15:
+        raise ValueError("Enter a valid mobile number (8-15 digits).")
+    return p
+
+
+def _validate_email(email):
+    e = (email or "").strip()
+    if not e:
+        raise ValueError("Email is required.")
+    if "@" not in e or "." not in e.split("@")[-1]:
+        raise ValueError("Please enter a valid email address.")
+    return e.lower()
+
+
+def _validate_name(name):
+    n = (name or "").strip()
+    if not n:
+        raise ValueError("Name is required.")
+    if len(n) < 2:
+        raise ValueError("Name must be at least 2 characters.")
+    return n
+
+
+def count_users():
+    with closing(_connect()) as conn:
+        return conn.execute("SELECT COUNT(*) FROM app_users").fetchone()[0]
+
+
+def list_app_users():
+    with closing(_connect()) as conn:
+        return conn.execute("SELECT * FROM app_users ORDER BY id ASC").fetchall()
+
+
+def get_user_by_id(user_id):
+    with closing(_connect()) as conn:
+        return conn.execute("SELECT * FROM app_users WHERE id = ?", (user_id,)).fetchone()
+
+
+def get_user_by_identifier(identifier):
+    ident = (identifier or "").strip()
+    if not ident:
+        return None
+    with closing(_connect()) as conn:
+        # try phone exact, then email case-insensitive
+        row = conn.execute("SELECT * FROM app_users WHERE phone = ?", (ident,)).fetchone()
+        if row:
+            return row
+        row = conn.execute("SELECT * FROM app_users WHERE LOWER(email) = LOWER(?)", (ident,)).fetchone()
+        return row
+
+
+def get_user_by_phone(phone):
+    with closing(_connect()) as conn:
+        return conn.execute("SELECT * FROM app_users WHERE phone = ?", ((phone or "").strip(),)).fetchone()
+
+
+def get_user_by_email(email):
+    with closing(_connect()) as conn:
+        return conn.execute("SELECT * FROM app_users WHERE LOWER(email)=LOWER(?)", ((email or "").strip(),)).fetchone()
+
+
+def create_app_user(name, phone, email, password, role="admin"):
+    name = _validate_name(name)
+    phone = _validate_phone(phone)
+    email = _validate_email(email)
+    pw = (password or "").strip()
+    if len(pw) < 6:
+        raise ValueError("Password must be at least 6 characters.")
+    if role not in ("admin", "user"):
+        role = "admin"
+    # first user must be admin
+    if count_users() == 0:
+        role = "admin"
+    pwd_hash, salt = _hash_password(pw)
+    with closing(_connect()) as conn, conn:
+        try:
+            cur = conn.execute(
+                "INSERT INTO app_users (name, phone, email, password_hash, password_salt, role) VALUES (?,?,?,?,?,?)",
+                (name, phone, email, pwd_hash, salt, role),
+            )
+            return cur.lastrowid
+        except sqlite3.IntegrityError as exc:
+            msg = str(exc).lower()
+            if "phone" in msg:
+                raise ValueError(f"Phone '{phone}' is already registered.")
+            if "email" in msg:
+                raise ValueError(f"Email '{email}' is already registered.")
+            raise ValueError("Phone or email already registered.")
+
+
+def verify_login(identifier, password):
+    ident = (identifier or "").strip()
+    pw = (password or "")
+    if not ident or not pw:
+        return None
+    user = get_user_by_identifier(ident)
+    if not user:
+        return None
+    if not user["is_active"]:
+        raise ValueError("This account is deactivated. Contact admin.")
+    if not _verify_password(pw, user["password_hash"], user["password_salt"]):
+        return None
+    return user
+
+
+def set_user_logged_in(user_id, logged_in=True):
+    with closing(_connect()) as conn, conn:
+        if logged_in:
+            # exclusive login? keep simple - mark this user logged_in, others maybe keep
+            conn.execute("UPDATE app_users SET is_logged_in=1, last_login=datetime('now') WHERE id=?", (user_id,))
+        else:
+            conn.execute("UPDATE app_users SET is_logged_in=0 WHERE id=?", (user_id,))
+
+
+def logout_all():
+    with closing(_connect()) as conn, conn:
+        conn.execute("UPDATE app_users SET is_logged_in=0")
+
+
+def update_user_password_by_phone(phone, new_password):
+    phone = _validate_phone(phone)
+    pw = (new_password or "").strip()
+    if len(pw) < 6:
+        raise ValueError("Password must be at least 6 characters.")
+    pwd_hash, salt = _hash_password(pw)
+    with closing(_connect()) as conn, conn:
+        cur = conn.execute("UPDATE app_users SET password_hash=?, password_salt=? WHERE phone=?", (pwd_hash, salt, phone))
+        if cur.rowcount == 0:
+            raise ValueError(f"No local user found with mobile '{phone}'.")
+        return cur.rowcount
+
+
+def update_user_password_by_id(user_id, new_password):
+    pw = (new_password or "").strip()
+    if len(pw) < 6:
+        raise ValueError("Password must be at least 6 characters.")
+    pwd_hash, salt = _hash_password(pw)
+    with closing(_connect()) as conn, conn:
+        conn.execute("UPDATE app_users SET password_hash=?, password_salt=? WHERE id=?", (pwd_hash, salt, user_id))
+
+
+def set_app_state(key, value):
+    with closing(_connect()) as conn, conn:
+        conn.execute("INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+def get_app_state(key, default=None):
+    with closing(_connect()) as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def delete_app_state(key):
+    with closing(_connect()) as conn, conn:
+        conn.execute("DELETE FROM app_state WHERE key=?", (key,))
+
+
+def get_stay_logged_in_user():
+    val = get_app_state("stay_logged_in_user_id")
+    if not val:
+        return None
+    stay = get_app_state("stay_logged_in")
+    if stay != "1":
+        return None
+    try:
+        uid = int(val)
+    except Exception:
+        return None
+    user = get_user_by_id(uid)
+    if not user or not user["is_active"]:
+        return None
+    return user
+
+
+def set_stay_logged_in(user_id, enabled=True):
+    if enabled:
+        set_app_state("stay_logged_in", "1")
+        set_app_state("stay_logged_in_user_id", str(user_id))
+    else:
+        delete_app_state("stay_logged_in")
+        delete_app_state("stay_logged_in_user_id")
+
+
+def clear_stay_logged_in():
+    delete_app_state("stay_logged_in")
+    delete_app_state("stay_logged_in_user_id")
+
+
+# ── App Config / Supabase Keys (persisted in DB for compiled builds) ──
+# Environment variables cannot be packed into a compiled build, so these
+# keys must also be configurable via the DB `app_state` table and managed
+# from Admin Setup UI.
+# Keys used: supabase_api_key, supabase_secret_key, supabase_url (optional override)
+
+def get_supabase_config():
+    """Return dict with api_key, secret_key, url from app_state (DB config)."""
+    return {
+        "api_key": get_app_state("supabase_api_key") or get_app_state("supabase_key") or "",
+        "secret_key": get_app_state("supabase_secret_key") or "",
+        "url": get_app_state("supabase_url") or "",
+    }
+
+
+def set_supabase_config(api_key=None, secret_key=None, url=None):
+    """Persist Supabase keys to app_state. Empty/None clears the key.
+
+    Returns the stored config dict.
+    Validation is minimal here; UI layer should enforce required fields.
+    """
+    if api_key is not None:
+        v = (api_key or "").strip()
+        if v:
+            set_app_state("supabase_api_key", v)
+        else:
+            delete_app_state("supabase_api_key")
+            # also clear legacy fallback if present
+            delete_app_state("supabase_key")
+    if secret_key is not None:
+        v = (secret_key or "").strip()
+        if v:
+            set_app_state("supabase_secret_key", v)
+        else:
+            delete_app_state("supabase_secret_key")
+    if url is not None:
+        v = (url or "").strip()
+        if v:
+            set_app_state("supabase_url", v)
+        else:
+            delete_app_state("supabase_url")
+    return get_supabase_config()
+
+
+def is_supabase_configured():
+    """True if both keys are present in DB or env (usable for Forgot Password)."""
+    cfg = get_supabase_config()
+    # also consider env as fallback
+    api_env = (os.environ.get("SUPABASE_API_KEY") or os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_KEY") or "").strip()
+    sec_env = (os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    api = (cfg["api_key"] or api_env).strip()
+    sec = (cfg["secret_key"] or sec_env).strip()
+    # if only one is set, legacy mode allows single key for both headers
+    return bool(api or sec)
