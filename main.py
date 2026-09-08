@@ -6,6 +6,7 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 from PIL import Image, ImageTk
 
 import db
+import auth
 import reporting
 from countries import COUNTRIES
 
@@ -653,8 +654,9 @@ class TenureDialog(tk.Toplevel):
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, current_user=None):
         super().__init__()
+        self.current_user = current_user  # sqlite Row from app_users
         self.title("Employee Information & Abroad Visit Tracker - IEDCR")
         try:
             self.state("zoomed")
@@ -679,6 +681,14 @@ class App(tk.Tk):
         style.configure("TCombobox", font=("Segoe UI", 11))
 
         db.init_db()
+        # Ensure current_user is fresh from DB (stay-logged-in path)
+        if self.current_user is not None:
+            try:
+                fresh = db.get_user_by_id(self.current_user["id"])
+                if fresh:
+                    self.current_user = fresh
+            except Exception:
+                pass
 
         # Top Header Frame (IEDCR Logo & Title)
         header_frame = ttk.Frame(self, padding=12)
@@ -722,6 +732,26 @@ class App(tk.Tk):
         title_wrap.pack(side="left", fill="x", expand=True)
         ttk.Label(title_wrap, text="Institute of Epidemiology, Disease Control and Research (IEDCR)", style="Heading.TLabel").pack(anchor="w")
         ttk.Label(title_wrap, text="Employee Information & Abroad Visit Tracker System", style="SubHeading.TLabel").pack(anchor="w")
+
+        # Right side: user info + actions
+        if self.current_user is not None:
+            user_box = ttk.Frame(header_frame)
+            user_box.pack(side="right", padx=(10,0), anchor="e")
+            uname = self.current_user["name"]
+            urole = self.current_user["role"]
+            uphone = self.current_user["phone"]
+            ttk.Label(user_box, text=f"{uname} ({urole})", font=("Segoe UI", 10, "bold"), foreground="#006633").pack(anchor="e")
+            ttk.Label(user_box, text=uphone, font=("Segoe UI", 9), foreground="#555").pack(anchor="e")
+            btn_box = ttk.Frame(user_box)
+            btn_box.pack(anchor="e", pady=(4,0))
+            if urole == "admin":
+                ttk.Button(btn_box, text="Manage Users", width=13, command=self.open_manage_users).pack(side="left", padx=2)
+            ttk.Button(btn_box, text="Logout", width=10, command=self.logout).pack(side="left", padx=2)
+        else:
+            # No user (should not happen after auth gate) - show login button
+            user_box = ttk.Frame(header_frame)
+            user_box.pack(side="right")
+            ttk.Button(user_box, text="Login", command=self.logout).pack(side="left")
 
         ttk.Separator(self, orient="horizontal").pack(fill="x", padx=12, pady=(0, 4))
 
@@ -1618,7 +1648,100 @@ class App(tk.Tk):
             except OSError as exc:
                 messagebox.showerror("Print failed", str(exc), parent=self)
 
+    # ── Auth actions ───────────────────────────────────────
+    def open_manage_users(self):
+        if not self.current_user or self.current_user["role"] != "admin":
+            messagebox.showerror("Access denied", "Only admin can manage users.", parent=self)
+            return
+        dlg = auth.ManageUsersDialog(self)
+        self.wait_window(dlg)
+        # refresh status if user self-deleted? just keep
+        try:
+            fresh = db.get_user_by_id(self.current_user["id"])
+            if not fresh:
+                # current admin was deleted -> force logout
+                self._do_logout(clear_stay=True)
+                return
+            self.current_user = fresh
+        except Exception:
+            pass
+
+    def logout(self):
+        if messagebox.askyesno("Logout", "Log out and return to login screen?", parent=self):
+            self._do_logout(clear_stay=False)
+
+    def _do_logout(self, clear_stay=False):
+        try:
+            if self.current_user:
+                db.set_user_logged_in(self.current_user["id"], False)
+            if clear_stay:
+                db.clear_stay_logged_in()
+            else:
+                # only clear stay if user unchecked stay? keep stay flag but clear logged_in
+                # Actually logout should clear stay_logged_in to require re-login unless user explicitly wants stay.
+                # We respect: if logout clicked, clear stay so next launch shows login.
+                db.clear_stay_logged_in()
+                db.logout_all()
+        except Exception:
+            pass
+        self.destroy()
+        # Re-launch login flow
+        _run_app_with_auth()
+
+    def _on_close(self):
+        try:
+            if self.current_user:
+                db.set_user_logged_in(self.current_user["id"], False)
+                # Do NOT clear stay_logged_in on window close - that is the "stay logged in" feature.
+                # Only clear stay if stay flag is 0.
+                if db.get_app_state("stay_logged_in") != "1":
+                    db.clear_stay_logged_in()
+                    db.logout_all()
+        except Exception:
+            pass
+        self.destroy()
+
+
+def _run_app_with_auth():
+    """Handle first-admin + login with stay-logged-in before creating App."""
+    import tkinter as tk
+    db.init_db()
+
+    # Fast path: stay logged in
+    stay = db.get_stay_logged_in_user()
+    if stay:
+        try:
+            db.set_user_logged_in(stay["id"], True)
+        except Exception:
+            pass
+        app = App(current_user=stay)
+        app.protocol("WM_DELETE_WINDOW", app._on_close)
+        app.mainloop()
+        return
+
+    # hidden root for dialogs - keep it withdrawn but let wait_window pump events
+    hidden = tk.Tk()
+    hidden.withdraw()
+    try:
+        hidden.update_idletasks()
+    except Exception:
+        pass
+
+    user = auth.do_login_flow(hidden)
+    try:
+        hidden.destroy()
+    except Exception:
+        pass
+
+    if not user:
+        # user exited login
+        return
+
+    app = App(current_user=user)
+    # override close to handle logged_out in db
+    app.protocol("WM_DELETE_WINDOW", app._on_close)
+    app.mainloop()
+
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    _run_app_with_auth()

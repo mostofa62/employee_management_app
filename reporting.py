@@ -17,6 +17,84 @@ ORG_SUBTITLE = "Employee Information & Abroad Visit Tracker System"
 FOOTER_COURTESY = "Courtesy: This software is developed by Golam Mostofa, Computer Programmer, Chittagong University"
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
 
+def _export_xlsx_via_openpyxl(path, rep, sheet_title, headers_list, rows_fn):
+    """Try openpyxl for trusted, fully compliant XLSX with logo. Returns True if success."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    except ImportError:
+        return False
+    try:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = sheet_title[:31]
+        wb.properties.creator = "IEDCR"
+        wb.properties.lastModifiedBy = "IEDCR"
+        logo_added = False
+        if os.path.isfile(LOGO_PATH) and LOGO_PATH.lower().endswith(".png"):
+            try:
+                from openpyxl.drawing.image import Image as XLImage
+                from PIL import Image as _PIL
+                pil = _PIL.open(LOGO_PATH)
+                w, h = pil.size
+                target_h = 36
+                scale = target_h / h if h else 1
+                img = XLImage(LOGO_PATH)
+                img.width = int(w * scale)
+                img.height = target_h
+                ws.add_image(img, "A1")
+                logo_added = True
+                ws.row_dimensions[1].height = 28
+                ws.row_dimensions[2].height = 14
+            except Exception:
+                logo_added = False
+        title_font = Font(name="Calibri", size=15, bold=True, color="006633")
+        subtitle_font = Font(name="Calibri", size=11, color="444444")
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        try:
+            ws.page_setup.orientation = "landscape"
+            ws.page_setup.paperSize = ws.PAPERSIZE_A3
+            ws.page_setup.fitToWidth = 1
+            ws.page_setup.fitToHeight = 0
+        except: pass
+        r = 1
+        if logo_added:
+            ws["B1"] = "Institute of Epidemiology, Disease Control and Research (IEDCR)"
+            ws["B1"].font = title_font
+            ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=6)
+            ws["B2"] = "Employee Information & Abroad Visit Tracker System"
+            ws["B2"].font = subtitle_font
+            ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=6)
+            r = 3
+        else:
+            ws[f"A{r}"] = "Institute of Epidemiology, Disease Control and Research (IEDCR)"
+            ws[f"A{r}"].font = title_font
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+            r+=1
+            ws[f"A{r}"] = "Employee Information & Abroad Visit Tracker System"
+            ws[f"A{r}"].font = subtitle_font
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+            r+=1
+        rows_fn(ws, r)
+        for col in ws.columns:
+            max_len=0
+            col_letter=col[0].column_letter
+            for cell in col:
+                try:
+                    v=str(cell.value) if cell.value is not None else ""
+                    max_len=max(max_len, min(len(v),45))
+                except: pass
+            try: ws.column_dimensions[col_letter].width=max(12, min(max_len*1.15+2,50))
+            except: pass
+        try: ws.freeze_panes="A7"
+        except: pass
+        wb.save(path)
+        return True
+    except Exception as e:
+        # import traceback; traceback.print_exc()
+        return False
+
+
 def _fmt_date(iso):
     """2026-01-26 -> 26 Jan 2026, keeps Ongoing/- as is."""
     if not iso or iso in ("Ongoing", "-", ""):
@@ -332,6 +410,151 @@ def _disp_len(value):
 
 def export_xlsx(path, year):
     rep = build_report(year)
+    # --- Trusted openpyxl path (avoids "We found a problem with some content" / Protected View trust warning) ---
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        from openpyxl.drawing.image import Image as XLImage
+        from PIL import Image as _PIL
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = f"Visit Report {rep['year']}"[:31]
+        wb.properties.creator = ORG_NAME
+        wb.properties.lastModifiedBy = ORG_NAME
+        # Embed logo properly via openpyxl (no manual drawing XML) - ensures Excel shows logo without "external content" prompt
+        logo_ok = False
+        if os.path.isfile(LOGO_PATH) and LOGO_PATH.lower().endswith(".png"):
+            try:
+                pil = _PIL.open(LOGO_PATH)
+                w, h = pil.size
+                target_h = 36
+                scale = target_h / h if h else 1
+                img = XLImage(LOGO_PATH)
+                img.width = int(w * scale)
+                img.height = target_h
+                ws.add_image(img, "A1")
+                ws.row_dimensions[1].height = 28
+                ws.row_dimensions[2].height = 14
+                logo_ok = True
+            except Exception:
+                logo_ok = False
+        # Styles
+        title_font = Font(name="Calibri", size=15, bold=True, color="006633")
+        subtitle_font = Font(name="Calibri", size=11, color="444444")
+        header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="006633", end_color="006633", fill_type="solid")
+        header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        normal_font = Font(name="Calibri", size=11)
+        bold_font = Font(name="Calibri", size=11, bold=True)
+        thin_border = Border(left=Side(style="thin", color="D9D9D9"), right=Side(style="thin", color="D9D9D9"), top=Side(style="thin", color="D9D9D9"), bottom=Side(style="thin", color="D9D9D9"))
+        center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        left_align = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        r = 1
+        if logo_ok:
+            ws["B1"] = ORG_NAME
+            ws["B1"].font = title_font
+            ws["B1"].alignment = Alignment(vertical="center")
+            ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=6)
+            ws["B2"] = ORG_SUBTITLE
+            ws["B2"].font = subtitle_font
+            ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=6)
+            r = 3
+        else:
+            ws[f"A{r}"] = ORG_NAME
+            ws[f"A{r}"].font = title_font
+            r+=1
+            ws[f"A{r}"] = ORG_SUBTITLE
+            ws[f"A{r}"].font = subtitle_font
+            r+=1
+        ws[f"A{r}"] = f"Abroad Visit Report - Year {rep['year']}"
+        ws[f"A{r}"].font = Font(name="Calibri", size=13, bold=True, color="006633")
+        r+=1
+        ws[f"A{r}"] = f"Generated: {rep['generated']}    Total employees: {rep['total_employees']}    Reached yearly limit: {rep['blocked_count']}"
+        ws[f"A{r}"].font = Font(name="Calibri", size=9, color="666666")
+        r+=1
+        r+=1
+        ws[f"A{r}"] = "YEARLY EMPLOYEE STATISTICS"
+        ws[f"A{r}"].font = Font(name="Calibri", size=11, bold=True, color="006633")
+        r+=1
+        # Header
+        for ci, h in enumerate(SUMMARY_HEADERS, start=1):
+            c = ws.cell(row=r, column=ci, value=h)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = header_align
+            c.border = thin_border
+        r+=1
+        for s in rep["stats"]:
+            row = _summary_row(s)
+            for ci, v in enumerate(row, start=1):
+                c = ws.cell(row=r, column=ci, value=v)
+                c.font = bold_font if s["status"].startswith("MAX REACHED") else normal_font
+                c.alignment = center_align if ci in (6,7,8,10) else left_align
+                c.border = thin_border
+            r+=1
+        r+=1
+        ws[f"A{r}"] = "VISIT DETAILS"
+        ws[f"A{r}"].font = Font(name="Calibri", size=11, bold=True, color="006633")
+        r+=1
+        for ci, h in enumerate(DETAIL_HEADERS, start=1):
+            c = ws.cell(row=r, column=ci, value=h)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = header_align
+            c.border = thin_border
+        r+=1
+        for d in rep["details"]:
+            if not d["visits"]:
+                ws.cell(row=r, column=1, value=d["emp_id"]).font = normal_font
+                ws.cell(row=r, column=2, value=d["name"]).font = normal_font
+                ws.cell(row=r, column=3, value=f"(no visits in {year})").font = normal_font
+                r+=1
+                continue
+            for v in d["visits"]:
+                vals = [d["emp_id"], d["name"], v["date"], v["country"], v["title"], v["detail"]]
+                for ci, val in enumerate(vals, start=1):
+                    c = ws.cell(row=r, column=ci, value=val)
+                    c.font = normal_font
+                    c.alignment = left_align
+                    c.border = thin_border
+                    c.alignment = Alignment(wrap_text=True, vertical="center")
+                r+=1
+        # Auto-fit widths
+        # Auto-fit widths: handle MergedCell (no column_letter) by using column index
+        try:
+            from openpyxl.utils import get_column_letter as _get_col_letter
+            for ci in range(1, ws.max_column + 1):
+                col_letter = _get_col_letter(ci)
+                max_len = 0
+                for row in ws.iter_rows(min_col=ci, max_col=ci):
+                    for cell in row:
+                        try:
+                            # skip merged placeholder cells that are MergedCell without value
+                            v = str(cell.value) if cell.value is not None else ""
+                            # ignore empty merged cells
+                            if v:
+                                max_len = max(max_len, min(len(v), 45))
+                        except: pass
+                try:
+                    ws.column_dimensions[col_letter].width = max(12, min(max_len*1.12+2, 50))
+                except: pass
+        except Exception:
+            pass
+        try:
+            ws.freeze_panes = "A7"
+            ws.sheet_properties.pageSetUpPr.fitToPage = True
+            ws.page_setup.orientation = "landscape"
+            ws.page_setup.paperSize = ws.PAPERSIZE_A3
+            ws.page_setup.fitToWidth = 1
+            ws.page_setup.fitToHeight = 0
+            ws.print_title_rows = "6:6"
+        except: pass
+        wb.save(path)
+        return
+    except ImportError:
+        pass
+    except Exception as e:
+        pass
     logo_info = _get_excel_logo()
 
     def cell(ref, value, style=None, numeric=False):
@@ -496,6 +719,102 @@ def export_xlsx(path, year):
 
 def export_tenure_xlsx(path, today=None):
     rep = build_tenure_report(today)
+    # --- Trusted openpyxl path ---
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        from openpyxl.drawing.image import Image as XLImage
+        from PIL import Image as _PIL
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Tenure Report"[:31]
+        wb.properties.creator = ORG_NAME
+        wb.properties.lastModifiedBy = ORG_NAME
+        logo_ok = False
+        if os.path.isfile(LOGO_PATH) and LOGO_PATH.lower().endswith(".png"):
+            try:
+                pil = _PIL.open(LOGO_PATH)
+                w, h = pil.size
+                target_h = 36
+                scale = target_h / h if h else 1
+                img = XLImage(LOGO_PATH)
+                img.width = int(w * scale)
+                img.height = target_h
+                ws.add_image(img, "A1")
+                ws.row_dimensions[1].height = 28
+                ws.row_dimensions[2].height = 14
+                logo_ok = True
+            except: logo_ok=False
+        title_font = Font(name="Calibri", size=15, bold=True, color="006633")
+        subtitle_font = Font(name="Calibri", size=11, color="444444")
+        header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="006633", end_color="006633", fill_type="solid")
+        header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        normal_font = Font(name="Calibri", size=11)
+        thin_border = Border(left=Side(style="thin", color="D9D9D9"), right=Side(style="thin", color="D9D9D9"), top=Side(style="thin", color="D9D9D9"), bottom=Side(style="thin", color="D9D9D9"))
+        left_align = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        r=1
+        if logo_ok:
+            ws["B1"]=ORG_NAME; ws["B1"].font=title_font; ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=6)
+            ws["B2"]=ORG_SUBTITLE; ws["B2"].font=subtitle_font; ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=6)
+            r=3
+        else:
+            ws[f"A{r}"]=ORG_NAME; ws[f"A{r}"].font=title_font; r+=1
+            ws[f"A{r}"]=ORG_SUBTITLE; ws[f"A{r}"].font=subtitle_font; r+=1
+        ws[f"A{r}"]=f"Tenure Report - As of {rep['today']}"; ws[f"A{r}"].font=Font(name="Calibri", size=13, bold=True, color="006633"); r+=1
+        ws[f"A{r}"]=f"Generated: {rep['generated']}    Total employees: {rep['total_employees']}    Active: {rep['active_count']}    Released: {rep['released_count']}"; ws[f"A{r}"].font=Font(name="Calibri", size=9, color="666666"); r+=2
+        ws[f"A{r}"]="TENURE SUMMARY (per employee)"; ws[f"A{r}"].font=Font(name="Calibri", size=11, bold=True, color="006633"); r+=1
+        for ci,h in enumerate(TENURE_SUMMARY_HEADERS, start=1):
+            c=ws.cell(row=r, column=ci, value=h); c.font=header_font; c.fill=header_fill; c.alignment=header_align; c.border=thin_border
+        r+=1
+        for s in rep["summaries"]:
+            row=_tenure_summary_row(s)
+            for ci,v in enumerate(row, start=1):
+                c=ws.cell(row=r, column=ci, value=v); c.font=normal_font; c.alignment=center_align if ci in (4,5) else left_align; c.border=thin_border
+            r+=1
+        r+=1
+        ws[f"A{r}"]="TENURE DETAILS (intervals)"; ws[f"A{r}"].font=Font(name="Calibri", size=11, bold=True, color="006633"); r+=1
+        for ci,h in enumerate(TENURE_DETAIL_HEADERS, start=1):
+            c=ws.cell(row=r, column=ci, value=h); c.font=header_font; c.fill=header_fill; c.alignment=header_align; c.border=thin_border
+        r+=1
+        for d in rep["details"]:
+            if not d["intervals"]:
+                ws.cell(row=r, column=1, value=d["emp_id"]).font=normal_font
+                ws.cell(row=r, column=2, value=d["name"]).font=normal_font
+                ws.cell(row=r, column=3, value="(no tenure)").font=normal_font
+                r+=1; continue
+            for iv in d["intervals"]:
+                vals=[d["emp_id"], d["name"], iv["join"], iv["release"], iv["duration"], iv["days"], iv["type"], iv["project"], iv["org"], iv["role"], iv["notes"]]
+                for ci,val in enumerate(vals, start=1):
+                    c=ws.cell(row=r, column=ci, value=val); c.font=normal_font; c.border=thin_border; c.alignment=Alignment(wrap_text=True, vertical="center")
+                r+=1
+                # Auto-fit widths: handle MergedCell
+        try:
+            from openpyxl.utils import get_column_letter as _get_col_letter
+            for ci in range(1, ws.max_column + 1):
+                col_letter = _get_col_letter(ci)
+                max_len = 0
+                for row in ws.iter_rows(min_col=ci, max_col=ci):
+                    for cell in row:
+                        try:
+                            v = str(cell.value) if cell.value is not None else ""
+                            if v:
+                                max_len = max(max_len, min(len(v), 45))
+                        except: pass
+                try:
+                    ws.column_dimensions[col_letter].width = max(12, min(max_len*1.12+2, 50))
+                except: pass
+        except Exception:
+            pass
+        try:
+            ws.freeze_panes="A7"; ws.sheet_properties.pageSetUpPr.fitToPage=True; ws.page_setup.orientation="landscape"; ws.page_setup.paperSize=ws.PAPERSIZE_A3; ws.page_setup.fitToWidth=1; ws.page_setup.fitToHeight=0
+        except: pass
+        wb.save(path); return
+    except ImportError:
+        pass
+    except Exception:
+        pass
     logo_info = _get_excel_logo()
     def cell(ref, value, style=None, numeric=False):
         s_attr = f' s="{style}"' if style is not None else ""
