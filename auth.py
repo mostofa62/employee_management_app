@@ -85,22 +85,41 @@ SUPABASE_SECRET_KEY = (
 SUPABASE_KEY = SUPABASE_API_KEY or SUPABASE_SECRET_KEY
 
 def _get_supabase_keys():
-    """Return (api_key, secret_key) resolving env + db app_state overrides."""
+    """Return (api_key, secret_key) resolving DB config first, then env.
+
+    DB (app_state / config table) is primary because env vars cannot be
+    packed into a compiled build. Env is fallback for dev / legacy.
+    """
     api = SUPABASE_API_KEY
     sec = SUPABASE_SECRET_KEY
-    # allow db app_state overrides
+    # DB config is primary source (required for compiled builds)
     try:
-        db_api = db.get_app_state("supabase_api_key") or db.get_app_state("supabase_key")
+        # Use helper if available (new), else direct app_state
+        if hasattr(db, "get_supabase_config"):
+            cfg = db.get_supabase_config()
+            db_api = (cfg.get("api_key") or "").strip()
+            db_sec = (cfg.get("secret_key") or "").strip()
+        else:
+            db_api = (db.get_app_state("supabase_api_key") or db.get_app_state("supabase_key") or "").strip()
+            db_sec = (db.get_app_state("supabase_secret_key") or "").strip()
         if db_api:
             api = db_api
-        db_sec = db.get_app_state("supabase_secret_key")
         if db_sec:
             sec = db_sec
     except Exception:
         pass
-    # re-read env in case it was set after import
-    api = os.environ.get("SUPABASE_API_KEY", api) or os.environ.get("SUPABASE_ANON_KEY", api) or api
-    sec = os.environ.get("SUPABASE_SECRET_KEY", sec) or os.environ.get("SUPABASE_SERVICE_KEY", sec) or sec
+    # Env is secondary (dev convenience). Only override if DB did not provide value.
+    env_api = (os.environ.get("SUPABASE_API_KEY", "") or os.environ.get("SUPABASE_ANON_KEY", "") or os.environ.get("SUPABASE_KEY", "") or "").strip()
+    env_sec = (os.environ.get("SUPABASE_SECRET_KEY", "") or os.environ.get("SUPABASE_SERVICE_KEY", "") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
+    if not api and env_api:
+        api = env_api
+    if not sec and env_sec:
+        sec = env_sec
+    # Also re-read current env if both were empty at import time but set later
+    if not api:
+        api = env_api
+    if not sec:
+        sec = env_sec
     # fallback: if only one is set, use it for both headers (matches curl sample where same key used)
     if not sec:
         sec = api
@@ -111,6 +130,23 @@ def _get_supabase_keys():
 def _get_supabase_key():
     api, sec = _get_supabase_keys()
     return api or sec
+
+def _get_supabase_url():
+    """Resolve Supabase URL: DB config > default constant."""
+    try:
+        if hasattr(db, "get_supabase_config"):
+            cfg = db.get_supabase_config()
+            url = (cfg.get("url") or "").strip()
+            if url:
+                return url
+        else:
+            url = (db.get_app_state("supabase_url") or "").strip()
+            if url:
+                return url
+    except Exception:
+        pass
+    return SUPABASE_URL
+
 
 def _supabase_headers():
     api_key, secret_key = _get_supabase_keys()
@@ -129,14 +165,15 @@ def supabase_reset_password(mobile, new_password, timeout=12):
     """POST to Supabase password_resets. Returns (ok, status, body)."""
     api_key, secret_key = _get_supabase_keys()
     if not api_key and not secret_key:
-        return False, 0, "Supabase keys not configured. Set SUPABASE_API_KEY and SUPABASE_SECRET_KEY env vars (or SUPABASE_KEY)."
+        return False, 0, "Supabase keys not configured. Go to Admin Setup -> Supabase Config and save SUPABASE_API_KEY and SUPABASE_SECRET_KEY (or set env vars SUPABASE_API_KEY / SUPABASE_SECRET_KEY)."
+    url = _get_supabase_url()
     try:
         import requests
     except ImportError:
         # fallback to urllib
         import urllib.request, urllib.error
         data = json.dumps({"mobile": mobile, "password": new_password}).encode("utf-8")
-        req = urllib.request.Request(SUPABASE_URL, data=data, headers=_supabase_headers(), method="POST")
+        req = urllib.request.Request(url, data=data, headers=_supabase_headers(), method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 body = resp.read().decode("utf-8", errors="ignore")
@@ -148,7 +185,7 @@ def supabase_reset_password(mobile, new_password, timeout=12):
             return False, 0, str(e)
     else:
         try:
-            resp = requests.post(SUPABASE_URL, json={"mobile": mobile, "password": new_password},
+            resp = requests.post(url, json={"mobile": mobile, "password": new_password},
                                  headers=_supabase_headers(), timeout=timeout)
             return resp.ok, resp.status_code, resp.text
         except Exception as e:
@@ -320,12 +357,15 @@ class ForgotPasswordDialog(tk.Toplevel):
         self.saved = False
         self.generated_pw = None
 
+        # Allow dialog to auto-expand for long success messages (wrap + entry)
         frm = ttk.Frame(self, padding=18)
         frm.pack(fill="both", expand=True)
+        # Make columns expand so Entry can stretch and wraplength can be wide
+        frm.columnconfigure(1, weight=1)
 
         # Logo centered top
         logo_top = ttk.Frame(frm)
-        logo_top.grid(row=0, column=0, columnspan=2, pady=(0,8))
+        logo_top.grid(row=0, column=0, columnspan=2, pady=(0,8), sticky="ew")
         _logo = _load_logo_image((48, 48))
         if _logo:
             self._logo_img = _logo
@@ -333,24 +373,47 @@ class ForgotPasswordDialog(tk.Toplevel):
             ttk.Label(logo_top, text="IEDCR", font=("Segoe UI", 11, "bold"), foreground="#006633").pack(side="left")
         ttk.Label(frm, text="Reset Password", font=("Segoe UI", 12, "bold")).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0,4))
         ttk.Label(frm, text="Enter your registered mobile number.\nIf it exists, a random password will be generated\ne.g. 7aB3x9Kp and synced to cloud + local DB.",
-                  foreground="#555", justify="left").grid(row=2, column=0, columnspan=2, sticky="w", pady=(0,10))
+                  foreground="#555", justify="left", wraplength=520).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0,10))
 
         self.var_phone = tk.StringVar()
 
         ttk.Label(frm, text="Mobile *").grid(row=3, column=0, sticky="w", padx=(0,10), pady=4)
-        ent_phone = ttk.Entry(frm, textvariable=self.var_phone, width=30)
+        ent_phone = ttk.Entry(frm, textvariable=self.var_phone, width=32)
         ent_phone.grid(row=3, column=1, sticky="we", pady=4)
 
-        self.lbl_status = ttk.Label(frm, text="", foreground="#006633", wraplength=360, justify="center", anchor="center")
+        # Status - wide wraplength so it auto-wraps instead of truncating; auto-scale handled via update
+        self.lbl_status = ttk.Label(frm, text="", foreground="#006633", wraplength=520, justify="left", anchor="w")
         self.lbl_status.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6,0))
 
-        self.progress = ttk.Progressbar(frm, mode="indeterminate", length=340)
+        self.progress = ttk.Progressbar(frm, mode="indeterminate", length=380)
         # hidden until syncing
         self.progress.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4,0))
         self.progress.grid_remove()
 
-        self.lbl_generated = ttk.Label(frm, text="", foreground="#0033cc", font=("Segoe UI", 10, "bold"), wraplength=360, justify="center", anchor="center")
-        self.lbl_generated.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6,0))
+        # ── Copy-friendly generated password area (hidden until success) ──
+        # Replaces old lbl_generated which was not selectable / truncated
+        self.frame_result = ttk.LabelFrame(frm, text="Generated password (copy friendly)", padding=10)
+        # not gridded yet - will be gridded on success at row 6
+        self.var_generated = tk.StringVar(value="")
+        self.lbl_generated_title = ttk.Label(self.frame_result, text="", foreground="#0033cc", font=("Segoe UI", 10, "bold"), wraplength=500, justify="left", anchor="w")
+        self.lbl_generated_title.pack(fill="x", pady=(0,6))
+        pw_row = ttk.Frame(self.frame_result)
+        pw_row.pack(fill="x", pady=(0,6))
+        self.ent_pw_display = ttk.Entry(pw_row, textvariable=self.var_generated, width=28, font=("Consolas", 13, "bold"), justify="center", state="readonly")
+        self.ent_pw_display.pack(side="left", fill="x", expand=True, padx=(0,8))
+        # Make readonly entry selectable: need to allow focus and selection
+        self.ent_pw_display.bind("<Button-1>", lambda e: self.ent_pw_display.selection_range(0, tk.END))
+        self.ent_pw_display.bind("<FocusIn>", lambda e: self.ent_pw_display.selection_range(0, tk.END))
+        self.btn_copy = ttk.Button(pw_row, text="Copy", width=8, command=self._copy_pw)
+        self.btn_copy.pack(side="left")
+        self.btn_show = ttk.Button(pw_row, text="Show", width=7, command=self._toggle_generated_visibility)
+        self.btn_show.pack(side="left", padx=(4,0))
+        self._pw_visible = True
+        self.lbl_copy_hint = ttk.Label(self.frame_result, text="Password auto-copied to clipboard. Click Copy to copy again. You can select text above and press Ctrl+C.", foreground="#555", wraplength=500, justify="left")
+        self.lbl_copy_hint.pack(fill="x")
+        # fallback label for simple text (kept for compatibility but now uses frame)
+        self.lbl_generated = ttk.Label(frm, text="", foreground="#0033cc", font=("Segoe UI", 10, "bold"), wraplength=520, justify="left", anchor="w")
+        # not gridded by default; frame_result will be used instead
 
         btns = ttk.Frame(frm)
         btns.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10,0))
@@ -420,6 +483,11 @@ class ForgotPasswordDialog(tk.Toplevel):
         # Disable button while syncing - show centered progress
         self.btn_reset.configure(state="disabled")
         self.lbl_status.configure(text=f"Generating password and syncing to cloud for {user['phone']}...", foreground="#006633")
+        # hide previous result if any
+        try:
+            self.frame_result.grid_remove()
+        except Exception:
+            pass
         self.lbl_generated.configure(text="")
         try:
             self.progress.grid()
@@ -442,7 +510,9 @@ class ForgotPasswordDialog(tk.Toplevel):
             messagebox.showerror("Cloud sync failed",
                                  f"Password reset NOT applied locally.\nCloud sync failed (status {status}).\n\n{detail}\n\nLocal DB was NOT updated (as required).",
                                  parent=self)
-            self.lbl_status.configure(text=f"Failed: {detail[:120]}", foreground="#cc0000")
+            # auto-scale status width for long error
+            self.lbl_status.configure(text=f"Failed: {detail[:300]}", foreground="#cc0000")
+            self._autosize()
             return
 
         # Success from API -> now update local sqlite with same generated password
@@ -454,20 +524,106 @@ class ForgotPasswordDialog(tk.Toplevel):
             return
 
         self.lbl_status.configure(text="Password synced to cloud and local DB.", foreground="#006633")
-        self.lbl_generated.configure(text=f"New password for {user['name']}:  {new_pw}  (use this to login)")
-        # show copy-friendly dialog with generated password
+        # ── Show copy-friendly result with auto-scale ──
+        self.var_generated.set(new_pw)
+        self.lbl_generated_title.configure(text=f"New password for {user['name']} ({user['phone']}):")
+        # ensure readonly entry shows plain text (visible)
+        self._pw_visible = True
+        self.ent_pw_display.configure(show="")
+        self.btn_show.configure(text="Hide")
+        # grid the result frame (was hidden); this will expand dialog width
+        try:
+            self.frame_result.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8,0))
+        except Exception:
+            pass
+        # also keep label for legacy (hidden)
+        self.lbl_generated.configure(text="")
+        # auto-scale dialog width to fit message + entry
+        self._autosize()
+        # copy to clipboard automatically + select text for manual Ctrl+C
         try:
             self.clipboard_clear()
             self.clipboard_append(new_pw)
         except Exception:
             pass
+        try:
+            self.ent_pw_display.focus_set()
+            self.ent_pw_display.selection_range(0, tk.END)
+        except Exception:
+            pass
+        # update hint to confirm copied
+        self.lbl_copy_hint.configure(text=f"Copied to clipboard! Select the password above and press Ctrl+C if needed. Use it to login.", foreground="#006633")
         messagebox.showinfo("Success",
-                            f"Password reset successful for {user['name']} ({user['phone']}).\n\nGenerated password: {new_pw}\n(Copied to clipboard)\n\nUse this to login. Supabase + local DB updated.",
+                            f"Password reset successful for {user['name']} ({user['phone']}).\n\nGenerated password: {new_pw}\n(Copied to clipboard - also available in the dialog with Copy button)\n\nUse this to login. Supabase + local DB updated.",
                             parent=self)
         self.saved = True
-        # keep dialog open so user can see password, but allow close
+        # keep dialog open so user can see password and copy, but allow close
         self.btn_reset.configure(state="normal")
         self.btn_reset.configure(text="Done", command=self.destroy)
+        # ensure still auto-sized after messagebox (which may have changed focus)
+        self._autosize()
+
+    def _copy_pw(self):
+        pw = self.var_generated.get().strip()
+        if not pw:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(pw)
+            self.update()
+        except Exception:
+            pass
+        # visual feedback
+        orig = self.btn_copy.cget("text")
+        self.btn_copy.configure(text="Copied!")
+        self.lbl_copy_hint.configure(text="Copied! You can also select the password and press Ctrl+C.", foreground="#006633")
+        # ensure entry text is selected for manual copy
+        try:
+            self.ent_pw_display.selection_range(0, tk.END)
+            self.ent_pw_display.focus_set()
+        except Exception:
+            pass
+        self.after(1500, lambda: self.btn_copy.configure(text="Copy") if self.winfo_exists() else None)
+
+    def _toggle_generated_visibility(self):
+        self._pw_visible = not self._pw_visible
+        self.ent_pw_display.configure(show="" if self._pw_visible else "•")
+        self.btn_show.configure(text="Hide" if self._pw_visible else "Show")
+
+    def _autosize(self):
+        """Auto-scale dialog width/height to fit wrapped messages and copy entry."""
+        try:
+            self.update_idletasks()
+            # Let ttk compute required size; expand if needed but cap to screen
+            req_w = self.winfo_reqwidth()
+            req_h = self.winfo_reqheight()
+            # ensure minimum width for copy-friendly layout (entry + buttons)
+            min_w = 520
+            w = max(req_w, min_w)
+            # also consider wraplength content: if status text long, ensure dialog wider
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            # cap to 85% of screen width
+            max_w = int(sw * 0.85)
+            w = min(w, max_w)
+            h = min(req_h, int(sh * 0.85))
+            # current position
+            cur_geo = self.geometry()
+            # only adjust size, keep centered if possible
+            try:
+                x = self.winfo_x()
+                y = self.winfo_y()
+                # keep on screen
+                if x + w > sw - 10:
+                    x = sw - w - 10
+                if y + h > sh - 40:
+                    y = sh - h - 40
+                x = max(10, x); y = max(10, y)
+                self.geometry(f"{w}x{h}+{x}+{y}")
+            except Exception:
+                self.geometry(f"{w}x{h}")
+        except Exception:
+            pass
 
 
 # ── Login Window ─────────────────────────────────────────────
@@ -711,6 +867,8 @@ class ManageUsersDialog(tk.Toplevel):
         ttk.Button(top, text="Add User", command=self._add).pack(side="left", padx=8)
         ttk.Button(top, text="Delete Selected", command=self._delete).pack(side="left", padx=4)
         ttk.Button(top, text="Reset Password", command=self._reset_pw).pack(side="left", padx=4)
+        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(top, text="Supabase Config", command=self._supabase_config).pack(side="left", padx=4)
         ttk.Button(top, text="Close", command=self.destroy).pack(side="right")
 
         cols = [("id","ID",50,"center"),("name","Name",140,"w"),("phone","Mobile",130,"w"),("email","Email",180,"w"),("role","Role",70,"center"),("status","Status",70,"center")]
@@ -800,6 +958,293 @@ class ManageUsersDialog(tk.Toplevel):
             self.refresh()
         except Exception as exc:
             messagebox.showerror("Error", str(exc), parent=self)
+
+    def _supabase_config(self):
+        dlg = SupabaseConfigDialog(self)
+        self.wait_window(dlg)
+
+
+class SupabaseConfigDialog(tk.Toplevel):
+    """Admin Setup - Supabase Config stored in DB config table (app_state).
+
+    Environment variables cannot be packed into a compiled build, so these
+    keys must be persisted in the database. This dialog lets an admin set
+    SUPABASE_API_KEY and SUPABASE_SECRET_KEY (and optional URL) into
+    app_state so the compiled exe works without env vars.
+    Required fields are marked with *.
+    """
+    def __init__(self, master):
+        super().__init__(master)
+        self.saved = False
+        self.title("Admin Setup - Supabase Config (DB)")
+        self.resizable(False, False)
+        frm = ttk.Frame(self, padding=18)
+        frm.pack(fill="both", expand=True)
+
+        # Header with logo
+        logo_top = ttk.Frame(frm)
+        logo_top.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        _logo = _load_logo_image((40, 40))
+        if _logo:
+            self._logo_img = _logo
+            ttk.Label(logo_top, image=_logo).pack(side="left", padx=(0, 8))
+        ttk.Label(logo_top, text="Supabase Configuration - Required for Forgot Password",
+                  font=("Segoe UI", 11, "bold"), foreground="#006633").pack(side="left")
+        ttk.Label(frm, text="Keys are saved to the database config table (app_state) so a compiled build works without env vars.",
+                  foreground="#555", wraplength=520, justify="left").grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 2))
+        ttk.Label(frm, text="Env vars (.env / OS env) are fallback only; DB values take priority.",
+                  foreground="#777", wraplength=520, justify="left").grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        # Current source hint
+        db.init_db()
+        cfg = {}
+        try:
+            cfg = db.get_supabase_config() if hasattr(db, "get_supabase_config") else {
+                "api_key": db.get_app_state("supabase_api_key") or db.get_app_state("supabase_key") or "",
+                "secret_key": db.get_app_state("supabase_secret_key") or "",
+                "url": db.get_app_state("supabase_url") or "",
+            }
+        except Exception:
+            cfg = {"api_key": "", "secret_key": "", "url": ""}
+
+        api_in_db = bool((cfg.get("api_key") or "").strip())
+        sec_in_db = bool((cfg.get("secret_key") or "").strip())
+        url_in_db = (cfg.get("url") or "").strip() or SUPABASE_URL
+        if api_in_db and sec_in_db:
+            src_text = "Status: Configured in DB (compiled build will work)."
+            src_color = "#006633"
+        elif api_in_db or sec_in_db:
+            src_text = "Status: Partially configured in DB - both keys are required."
+            src_color = "#cc7700"
+        else:
+            # check env fallback
+            env_api = (os.environ.get("SUPABASE_API_KEY") or os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_KEY") or "").strip()
+            env_sec = (os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+            if env_api or env_sec:
+                src_text = "Status: Using env vars (.env) - save to DB to support compiled build."
+                src_color = "#cc7700"
+            else:
+                src_text = "Status: NOT configured - Forgot Password will fail. Both keys are required."
+                src_color = "#cc0000"
+        self.lbl_status = ttk.Label(frm, text=src_text, foreground=src_color, wraplength=520, justify="left", font=("Segoe UI", 9, "bold"))
+        self.lbl_status.grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        # Fields
+        self.var_api = tk.StringVar(value=cfg.get("api_key") or "")
+        self.var_secret = tk.StringVar(value=cfg.get("secret_key") or "")
+        self.var_url = tk.StringVar(value=cfg.get("url") or SUPABASE_URL)
+        self.var_show = tk.BooleanVar(value=False)
+
+        ttk.Label(frm, text="SUPABASE_API_KEY *").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.ent_api = ttk.Entry(frm, textvariable=self.var_api, width=58, show="•")
+        self.ent_api.grid(row=4, column=1, columnspan=2, sticky="we", pady=4)
+        ttk.Label(frm, text="SUPABASE_SECRET_KEY *").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.ent_secret = ttk.Entry(frm, textvariable=self.var_secret, width=58, show="•")
+        self.ent_secret.grid(row=5, column=1, columnspan=2, sticky="we", pady=4)
+        ttk.Label(frm, text="Supabase URL").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.ent_url = ttk.Entry(frm, textvariable=self.var_url, width=58)
+        self.ent_url.grid(row=6, column=1, columnspan=2, sticky="we", pady=4)
+        hint = ttk.Label(frm, text="Find keys: Supabase Dashboard -> Project Settings -> API. API key = anon public, Secret = service_role.",
+                         foreground="#666", wraplength=520, justify="left")
+        hint.grid(row=7, column=0, columnspan=3, sticky="w", pady=(2, 6))
+
+        ttk.Checkbutton(frm, text="Show keys", variable=self.var_show,
+                        command=self._toggle_show).grid(row=8, column=0, columnspan=3, sticky="w", pady=(2, 6))
+
+        self.lbl_msg = ttk.Label(frm, text="", foreground="#cc0000", wraplength=520, justify="left")
+        self.lbl_msg.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        ttk.Button(btns, text="Import from .env", command=self._import_env).pack(side="left")
+        ttk.Button(btns, text="Clear DB Config", command=self._clear).pack(side="left", padx=6)
+        ttk.Button(btns, text="Test Connection", command=self._test).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(btns, text="Save to DB", command=self._save).pack(side="right", padx=6)
+
+        self.bind("<Return>", lambda e: self._save())
+        self.bind("<Escape>", lambda e: self.destroy())
+        try:
+            if master.winfo_viewable():
+                self.transient(master)
+        except Exception:
+            pass
+        self.update_idletasks()
+        self.deiconify()
+        try:
+            if master.winfo_viewable():
+                self.grab_set()
+        except Exception:
+            pass
+        try:
+            self.focus_set()
+        except Exception:
+            pass
+        # center
+        try:
+            self.update_idletasks()
+            w, h = self.winfo_width(), self.winfo_height()
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            if master.winfo_viewable():
+                mx, my, mw, mh = master.winfo_rootx(), master.winfo_rooty(), master.winfo_width(), master.winfo_height()
+                x, y = mx + (mw - w)//2, my + (mh - h)//2
+            else:
+                x, y = (sw - w)//2, (sh - h)//2 - 40
+            x = max(10, min(x, sw - w - 10))
+            y = max(10, min(y, sh - h - 40))
+            self.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+    def _toggle_show(self):
+        show = "" if self.var_show.get() else "•"
+        self.ent_api.configure(show=show)
+        self.ent_secret.configure(show=show)
+
+    def _import_env(self):
+        # read .env file directly if python-dotenv not loaded, and env vars
+        env_api = (os.environ.get("SUPABASE_API_KEY") or os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_KEY") or "").strip()
+        env_sec = (os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+        # also try reading .env file manually as fallback
+        if not env_api or not env_sec:
+            try:
+                base = os.path.dirname(os.path.abspath(__file__))
+                env_path = os.path.join(base, ".env")
+                if os.path.isfile(env_path):
+                    with open(env_path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            line=line.strip()
+                            if not line or line.startswith("#") or "=" not in line:
+                                continue
+                            k,v=line.split("=",1)
+                            k=k.strip(); v=v.strip().strip('"').strip("'")
+                            if k=="SUPABASE_API_KEY" and not env_api and v:
+                                env_api=v
+                            elif k=="SUPABASE_SECRET_KEY" and not env_sec and v:
+                                env_sec=v
+            except Exception:
+                pass
+        if env_api:
+            self.var_api.set(env_api)
+        if env_sec:
+            self.var_secret.set(env_sec)
+        if env_api or env_sec:
+            self.lbl_msg.configure(text="Imported keys from env/.env into fields. Click Save to persist to DB.", foreground="#006633")
+        else:
+            self.lbl_msg.configure(text="No keys found in env or .env file.", foreground="#cc0000")
+
+    def _clear(self):
+        if not messagebox.askyesno("Clear DB Config", "Clear Supabase keys from DB config table?\nEnv vars will still work for dev, but compiled build will have no keys.", parent=self):
+            return
+        try:
+            if hasattr(db, "set_supabase_config"):
+                db.set_supabase_config(api_key="", secret_key="", url="")
+            else:
+                db.delete_app_state("supabase_api_key")
+                db.delete_app_state("supabase_key")
+                db.delete_app_state("supabase_secret_key")
+                db.delete_app_state("supabase_url")
+            self.var_api.set("")
+            self.var_secret.set("")
+            self.var_url.set(SUPABASE_URL)
+            self.lbl_msg.configure(text="DB config cleared.", foreground="#cc7700")
+            self.lbl_status.configure(text="Status: NOT configured - both keys are required.", foreground="#cc0000")
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc), parent=self)
+
+    def _test(self):
+        api = self.var_api.get().strip()
+        sec = self.var_secret.get().strip()
+        url = self.var_url.get().strip() or SUPABASE_URL
+        if not api or not sec:
+            messagebox.showerror("Missing", "Both SUPABASE_API_KEY and SUPABASE_SECRET_KEY are required for test.", parent=self)
+            return
+        self.lbl_msg.configure(text="Testing connection...", foreground="#006633")
+        self.update_idletasks()
+        # quick header check + optional lightweight GET to password_resets with limit 1
+        headers = {
+            "apikey": api,
+            "Authorization": f"Bearer {sec}",
+            "Content-Type": "application/json",
+        }
+        test_url = url.split("?")[0] + "?select=mobile&limit=1"
+        ok, status, body = False, 0, ""
+        try:
+            import requests
+            try:
+                resp = requests.get(test_url, headers=headers, timeout=8)
+                ok, status, body = resp.ok, resp.status_code, resp.text
+            except Exception as e:
+                ok, status, body = False, 0, str(e)
+        except ImportError:
+            import urllib.request, urllib.error
+            try:
+                req = urllib.request.Request(test_url, headers=headers, method="GET")
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    body = resp.read().decode("utf-8", errors="ignore")
+                    ok, status = 200 <= resp.status < 300, resp.status
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="ignore") if hasattr(e, 'read') else str(e)
+                ok, status = False, e.code
+            except Exception as e:
+                ok, status, body = False, 0, str(e)
+        if ok:
+            self.lbl_msg.configure(text=f"Connection OK (HTTP {status}). Keys look valid.", foreground="#006633")
+            messagebox.showinfo("Test OK", f"Supabase reachable (HTTP {status}).\nKeys appear valid.", parent=self)
+        else:
+            detail = (body or "")[:400]
+            self.lbl_msg.configure(text=f"Test failed (HTTP {status}). {detail[:80]}", foreground="#cc0000")
+            messagebox.showerror("Test Failed", f"HTTP {status}\n{detail}\n\nCheck keys / URL and network.", parent=self)
+
+    def _save(self):
+        api = self.var_api.get().strip()
+        sec = self.var_secret.get().strip()
+        url = self.var_url.get().strip()
+        if not api:
+            messagebox.showerror("Required", "SUPABASE_API_KEY is required (anon public key).", parent=self)
+            return
+        if not sec:
+            messagebox.showerror("Required", "SUPABASE_SECRET_KEY is required (service_role key).", parent=self)
+            return
+        # basic JWT-like check
+        if len(api) < 20 or len(sec) < 20:
+            if not messagebox.askyesno("Confirm", "Keys look unusually short. Save anyway?", parent=self):
+                return
+        if url and not url.startswith("http"):
+            messagebox.showerror("Invalid URL", "Supabase URL must start with http(s).", parent=self)
+            return
+        try:
+            db.init_db()
+            if hasattr(db, "set_supabase_config"):
+                db.set_supabase_config(api_key=api, secret_key=sec, url=url if url != SUPABASE_URL else "")
+                # if user changed URL from default, store even if empty means default
+                if url and url != SUPABASE_URL:
+                    db.set_app_state("supabase_url", url)
+                elif not url or url == SUPABASE_URL:
+                    # store only if custom; remove if back to default to avoid clutter, but keep if explicit
+                    # Keep DB clean: delete if equals default
+                    try:
+                        cur = db.get_app_state("supabase_url")
+                        if cur == SUPABASE_URL:
+                            pass
+                        if url == SUPABASE_URL:
+                            db.delete_app_state("supabase_url")
+                    except Exception:
+                        pass
+            else:
+                db.set_app_state("supabase_api_key", api)
+                db.set_app_state("supabase_secret_key", sec)
+                if url and url != SUPABASE_URL:
+                    db.set_app_state("supabase_url", url)
+                else:
+                    db.delete_app_state("supabase_url")
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc), parent=self)
+            return
+        self.lbl_msg.configure(text="Saved to DB config table. Compiled build will now have keys.", foreground="#006633")
+        messagebox.showinfo("Saved", "Supabase keys saved to database config table (app_state).\nCompiled builds will read them without env vars.", parent=self)
+        self.saved = True
+        self.destroy()
 
 
 def ensure_first_admin(parent):

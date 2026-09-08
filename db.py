@@ -186,6 +186,37 @@ def init_db():
     with closing(_connect()) as conn, conn:
         conn.executescript(_SCHEMA)
         _migrate(conn)
+    # Auto-seed Supabase keys from env/.env into DB config table if DB is empty
+    # (helps first-run and avoids manual re-entry; compiled builds then have keys)
+    try:
+        cfg = get_supabase_config()
+        if not (cfg.get("api_key") or "").strip() and not (cfg.get("secret_key") or "").strip():
+            env_api = (os.environ.get("SUPABASE_API_KEY") or os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_KEY") or "").strip()
+            env_sec = (os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+            # also try .env file directly (covers compiled build where python-dotenv may not have loaded yet)
+            if not env_api or not env_sec:
+                try:
+                    base = Path(__file__).resolve().with_name(".env")
+                    if base.is_file():
+                        for line in base.read_text(encoding="utf-8", errors="ignore").splitlines():
+                            line=line.strip()
+                            if not line or line.startswith("#") or "=" not in line:
+                                continue
+                            k,v=line.split("=",1)
+                            k=k.strip(); v=v.strip().strip('"').strip("'")
+                            if k=="SUPABASE_API_KEY" and not env_api and v:
+                                env_api=v
+                            elif k=="SUPABASE_SECRET_KEY" and not env_sec and v:
+                                env_sec=v
+                except Exception:
+                    pass
+            if env_api or env_sec:
+                if env_api:
+                    set_app_state("supabase_api_key", env_api)
+                if env_sec:
+                    set_app_state("supabase_secret_key", env_sec)
+    except Exception:
+        pass
 
 
 EMPLOYEE_TYPES = ("Government", "Non-Government")
@@ -1153,3 +1184,59 @@ def set_stay_logged_in(user_id, enabled=True):
 def clear_stay_logged_in():
     delete_app_state("stay_logged_in")
     delete_app_state("stay_logged_in_user_id")
+
+
+# ── App Config / Supabase Keys (persisted in DB for compiled builds) ──
+# Environment variables cannot be packed into a compiled build, so these
+# keys must also be configurable via the DB `app_state` table and managed
+# from Admin Setup UI.
+# Keys used: supabase_api_key, supabase_secret_key, supabase_url (optional override)
+
+def get_supabase_config():
+    """Return dict with api_key, secret_key, url from app_state (DB config)."""
+    return {
+        "api_key": get_app_state("supabase_api_key") or get_app_state("supabase_key") or "",
+        "secret_key": get_app_state("supabase_secret_key") or "",
+        "url": get_app_state("supabase_url") or "",
+    }
+
+
+def set_supabase_config(api_key=None, secret_key=None, url=None):
+    """Persist Supabase keys to app_state. Empty/None clears the key.
+
+    Returns the stored config dict.
+    Validation is minimal here; UI layer should enforce required fields.
+    """
+    if api_key is not None:
+        v = (api_key or "").strip()
+        if v:
+            set_app_state("supabase_api_key", v)
+        else:
+            delete_app_state("supabase_api_key")
+            # also clear legacy fallback if present
+            delete_app_state("supabase_key")
+    if secret_key is not None:
+        v = (secret_key or "").strip()
+        if v:
+            set_app_state("supabase_secret_key", v)
+        else:
+            delete_app_state("supabase_secret_key")
+    if url is not None:
+        v = (url or "").strip()
+        if v:
+            set_app_state("supabase_url", v)
+        else:
+            delete_app_state("supabase_url")
+    return get_supabase_config()
+
+
+def is_supabase_configured():
+    """True if both keys are present in DB or env (usable for Forgot Password)."""
+    cfg = get_supabase_config()
+    # also consider env as fallback
+    api_env = (os.environ.get("SUPABASE_API_KEY") or os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_KEY") or "").strip()
+    sec_env = (os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    api = (cfg["api_key"] or api_env).strip()
+    sec = (cfg["secret_key"] or sec_env).strip()
+    # if only one is set, legacy mode allows single key for both headers
+    return bool(api or sec)

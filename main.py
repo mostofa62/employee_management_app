@@ -745,6 +745,7 @@ class App(tk.Tk):
             btn_box = ttk.Frame(user_box)
             btn_box.pack(anchor="e", pady=(4,0))
             if urole == "admin":
+                ttk.Button(btn_box, text="Admin Setup", width=12, command=self.open_admin_setup).pack(side="left", padx=2)
                 ttk.Button(btn_box, text="Manage Users", width=13, command=self.open_manage_users).pack(side="left", padx=2)
             ttk.Button(btn_box, text="Logout", width=10, command=self.logout).pack(side="left", padx=2)
         else:
@@ -1648,7 +1649,30 @@ class App(tk.Tk):
             except OSError as exc:
                 messagebox.showerror("Print failed", str(exc), parent=self)
 
-    # ── Auth actions ───────────────────────────────────────
+    # ── Auth / Admin Setup ────────────────────────────────
+    def open_admin_setup(self):
+        """Admin Setup - Supabase keys stored in DB config table (required for compiled builds)."""
+        if not self.current_user or self.current_user["role"] != "admin":
+            messagebox.showerror("Access denied", "Only admin can open Admin Setup.", parent=self)
+            return
+        dlg = auth.SupabaseConfigDialog(self)
+        self.wait_window(dlg)
+        if dlg.saved:
+            self.set_status("Supabase config saved to DB (Admin Setup). Compiled builds will use it.")
+        # also warn if not configured
+        try:
+            cfg = db.get_supabase_config()
+            if not (cfg.get("api_key") or "").strip() or not (cfg.get("secret_key") or "").strip():
+                # check env fallback still Warn but don't block
+                if not db.is_supabase_configured():
+                    self.set_status("Warning: Supabase keys not configured - Forgot Password will fail. Open Admin Setup to fix.")
+        except Exception:
+            pass
+
+    def open_supabase_config(self):
+        # alias for backward compat / quick access
+        return self.open_admin_setup()
+
     def open_manage_users(self):
         if not self.current_user or self.current_user["role"] != "admin":
             messagebox.showerror("Access denied", "Only admin can manage users.", parent=self)
