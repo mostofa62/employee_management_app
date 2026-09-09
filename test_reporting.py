@@ -35,11 +35,9 @@ for i in range(1, 31):
 db.add_employee("E300", "Nobody Visits", "Clerk", max_visits=2)
 
 out = tempfile.mkdtemp()
-csv_path = os.path.join(out, "r.csv")
 xlsx_path = os.path.join(out, "r.xlsx")
 pdf_path = os.path.join(out, "r.pdf")
 
-reporting.export_csv(csv_path, "2026")
 reporting.export_xlsx(xlsx_path, "2026")
 reporting.export_pdf(pdf_path, "2026")
 
@@ -56,21 +54,14 @@ check("unicode pdf draws CID hex text", re.search(rb"<[0-9A-F]{8}> Tj", udata) i
 check("unicode pdf has CIDFontType2", b"/CIDFontType2" in udata)
 check("unicode pdf W array present", b"/W [" in udata)
 
-check("csv created", os.path.getsize(csv_path) > 100)
 check("xlsx created", os.path.getsize(xlsx_path) > 500)
 check("pdf created", os.path.getsize(pdf_path) > 800)
 
-import csv as _csv
-
-with open(csv_path, encoding="utf-8-sig", newline="") as f:
-    rows = list(_csv.reader(f))
-check("csv has stats header", any("YEARLY EMPLOYEE STATISTICS" in r for r in rows if r))
-check("csv has details header", any("VISIT DETAILS" in r for r in rows if r))
-det_start = next(i for i, r in enumerate(rows) if r and "VISIT DETAILS" in r[0])
-detail_rows = [r for r in rows[det_start + 2:] if r]
-check("csv has E100 visits (2)", sum(1 for r in detail_rows if r[0] == "E100") == 2)
-check("csv has E200 visits (30)", sum(1 for r in detail_rows if r[0] == "E200") == 30)
-check("csv skips zero-visit employee", not any(r and "E300" in r[0] for r in detail_rows))
+rep = reporting.build_report("2026")
+by_emp = {d["emp_id"]: d for d in rep["details"]}
+check("report has E100 visits (2)", len(by_emp.get("E100", {}).get("visits", [])) == 2)
+check("report has E200 visits (30)", len(by_emp.get("E200", {}).get("visits", [])) == 30)
+check("report skips zero-visit employee", "E300" not in by_emp)
 
 with zipfile.ZipFile(xlsx_path) as z:
     names = set(z.namelist())
@@ -119,7 +110,7 @@ for k in kids:
         break
 check("pdf every page has content stream with text", streams_ok)
 first_stream_id = int(re.search(rb"/Contents (\d+) 0 R", objs[kids[0]]).group(1))
-check("pdf page 1 contains the report title", b"Abroad Visit Report" in objs[first_stream_id])
+check("pdf page 1 contains the report title", b"Employee Visit Report" in objs[first_stream_id])
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

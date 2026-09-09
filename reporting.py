@@ -1,4 +1,3 @@
-import csv
 import os
 import re
 import zlib
@@ -13,7 +12,7 @@ import db
 _ILLEGAL_XML = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
 ORG_NAME = "Institute of Epidemiology, Disease Control and Research (IEDCR)"
-ORG_SUBTITLE = "Employee Information & Abroad Visit Tracker System"
+ORG_SUBTITLE = "Employee Information & Visit Tracker System"
 FOOTER_COURTESY = "Courtesy: This software is developed by Golam Mostofa, Computer Programmer, Chittagong University"
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
 
@@ -62,7 +61,7 @@ def _export_xlsx_via_openpyxl(path, rep, sheet_title, headers_list, rows_fn):
             ws["B1"] = "Institute of Epidemiology, Disease Control and Research (IEDCR)"
             ws["B1"].font = title_font
             ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=6)
-            ws["B2"] = "Employee Information & Abroad Visit Tracker System"
+            ws["B2"] = "Employee Information & Visit Tracker System"
             ws["B2"].font = subtitle_font
             ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=6)
             r = 3
@@ -71,7 +70,7 @@ def _export_xlsx_via_openpyxl(path, rep, sheet_title, headers_list, rows_fn):
             ws[f"A{r}"].font = title_font
             ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
             r+=1
-            ws[f"A{r}"] = "Employee Information & Abroad Visit Tracker System"
+            ws[f"A{r}"] = "Employee Information & Visit Tracker System"
             ws[f"A{r}"].font = subtitle_font
             ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
             r+=1
@@ -100,20 +99,90 @@ def _fmt_date(iso):
     if not iso or iso in ("Ongoing", "-", ""):
         return str(iso) if iso else ""
     s = str(iso).strip()
-    # handle already formatted or empty
     if not s or s.lower() == "ongoing":
         return s
     try:
-        # try ISO first
         dt = datetime.strptime(s, "%Y-%m-%d")
         return dt.strftime("%d %b %Y")
     except Exception:
         try:
-            # try already datetime with time
-            dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
-            return dt.strftime("%d %b %Y %H:%M")
+            return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%d %b %Y")
         except Exception:
             return s
+
+
+def _fmt_datetime(date_iso, time_iso):
+    """'2026-01-26','09:00' -> '26 Jan 2026 at 09:00 AM'. Keeps date-only if no time."""
+    d = _fmt_date(date_iso)
+    if not d or not time_iso or time_iso in ("", "-"):
+        return d
+    try:
+        t = datetime.strptime(str(time_iso).strip(), "%H:%M")
+        ap = t.strftime("%p").upper()  # AM/PM
+        th = t.strftime("%I:%M")      # 09:00 or 12:00
+        return f"{d} at {th} {ap}"
+    except Exception:
+        return d
+
+def _fmt_12(time_iso):
+    """'10:20' -> '10:20 AM', '' -> ''."""
+    if not time_iso or str(time_iso).strip() in ("", "-"):
+        return ""
+    try:
+        t = datetime.strptime(str(time_iso).strip(), "%H:%M")
+        return f"{t.strftime('%I:%M')} {t.strftime('%p').upper()}"
+    except Exception:
+        return str(time_iso).strip()
+
+
+def _fmt_slot(date_iso, start_time="", end_time="", is_full_day=False, note=""):
+    """Full-format single-day slot, e.g. '10 Jan 2026 at 10:20 AM - 12:30 PM'.
+    No times -> bare date (off days get ' (off)'). No '(full day)' text."""
+    d = _fmt_date(date_iso)
+    if not d:
+        return ""
+    s12, e12 = _fmt_12(start_time), _fmt_12(end_time)
+    if s12 and e12:
+        txt = f"{d} at {s12} - {e12}"
+    elif s12:
+        txt = f"{d} at {s12}"
+    elif e12:
+        txt = f"{d} at {e12}"
+    else:
+        txt = f"{d}" if not is_full_day else d
+    if note and str(note).strip():
+        txt += f" ({str(note).strip()})"
+    return txt
+
+
+def _pdf_time_groups(time_txt):
+    """Split 'DATE at TIME' slot lines into [DATE, 'at TIME'] group line pairs
+    so narrow PDF columns keep each day's date+time together instead of
+    word-wrapping mid-slot."""
+    groups = []
+    for line in str(time_txt or "").split("\n"):
+        seg = line.strip()
+        if not seg:
+            continue
+        if " at " in seg:
+            date_part, time_part = seg.split(" at ", 1)
+            groups.append(date_part.strip())
+            groups.append("at " + time_part.strip())
+        else:
+            groups.append(seg)
+    return "\n".join(groups)
+
+
+def _fmt_period(start_iso, end_iso):
+    """Always include the range: '10 Jan 2026' or '10 Jan 2026 to 12 Jan 2026'."""
+    s = _fmt_date(start_iso)
+    e = _fmt_date(end_iso or start_iso)
+    if not s:
+        return e
+    if not e or s == e:
+        return s
+    return f"{s} to {e}"
+
 
 def _fmt_generated(dt_str):
     """2026-09-07 14:30 -> 07 Sep 2026 14:30"""
@@ -204,68 +273,77 @@ def _status_fields(limit, used, times_reached):
 
 def build_report(year):
     year = str(year)
-    stats = []
+    # Statistics are segmented by visit type. The yearly limit (and MAX
+    # REACHED blocking) applies to Abroad visits only; Local visits are
+    # unlimited and tracked as plain counts. Visit details stay combined.
+    abroad_stats = []
+    local_stats = []
     for r in db.summary(year):
         limit = r["max_visits"]
         used = r["used_this_year"]
         local = r["local_this_year"] if "local_this_year" in r.keys() else 0
-        # include employees with abroad OR local visits in this year
-        if used == 0 and local == 0:
-            continue
-        remaining, status, reached = _status_fields(limit, used, r["times_max_reached"])
-        stats.append({
+        base = {
             "emp_id": r["emp_id"],
             "name": r["name"],
             "designation": r["designation"],
             "emp_type": r["emp_type"] or "",
             "project": r["project_name"] or "",
-            "limit_txt": "Unlimited" if limit == 0 else str(limit),
-            "used": used,
-            "local": local,
-            "remaining": remaining,
-            "status": status,
-            "reached": reached,
-        })
+        }
+        if used > 0:
+            remaining, status, reached = _status_fields(limit, used, r["times_max_reached"])
+            abroad_stats.append({
+                **base,
+                "limit_txt": "Unlimited" if limit == 0 else str(limit),
+                "used": used,
+                "remaining": remaining,
+                "status": status,
+                "reached": reached,
+            })
+        if local > 0:
+            local_stats.append({**base, "local": local})
     def _visit_dict(v):
         s = v["start_date"] or v["visit_date"]
         e = v["end_date"] or s
-        period = s if s == e else f"{s} -> {e}"
+        # Period always carries the full range when From/To differ.
+        period = _fmt_period(s, e)
         try:
             mode = v["time_mode"] if "time_mode" in v.keys() else "fixed"
         except Exception:
             mode = "fixed"
+        base_detail = (v["purpose_detail"] or "").strip()
         if (mode or "fixed") == "per_day":
-            try:
-                time_txt = db.visit_time_summary(dict(v))
-            except Exception:
-                time_txt = "per-day"
             try:
                 day_rows = [dict(r) for r in db.list_visit_days(v["id"])]
             except Exception:
                 day_rows = []
-            parts = []
-            for d in day_rows:
-                slot = f"{d['start_time']}-{d['end_time']}".strip("-") if (d["start_time"] or d["end_time"]) else "off"
-                if d["is_full_day"] and (d["start_time"] or d["end_time"]):
-                    slot = f"full {slot}"
-                bit = f"{d['day_date'][5:]}: {slot}"
-                if d["note"]:
-                    bit += f" ({d['note']})"
-                parts.append(bit)
-            day_txt = "; ".join(parts)
-        else:
-            if v["start_time"] or v["end_time"]:
-                time_txt = f"{v['start_time']}-{v['end_time']}".strip("-")
+            # Time column: date + time slots only, one day per line, no notes.
+            time_val = "\n".join(
+                _fmt_slot(d["day_date"], d["start_time"], d["end_time"],
+                          bool(d["is_full_day"]))
+                for d in day_rows
+            )
+            # Purpose Details: user purpose first, then an <hr>-style rule,
+            # then each day line by line with its time slot + note.
+            day_lines = [
+                _fmt_slot(d["day_date"], d["start_time"], d["end_time"],
+                          bool(d["is_full_day"]), d["note"])
+                for d in day_rows
+            ]
+            if base_detail and day_lines:
+                detail = base_detail + "\n" + DAYWISE_SEP + "\n" + "\n".join(day_lines)
+            elif day_lines:
+                detail = "\n".join(day_lines)
             else:
-                time_txt = "Full day" if v["is_full_day"] else ""
-            day_txt = ""
-        detail = v["purpose_detail"] or ""
-        if day_txt:
-            detail = f"{detail} [Day-wise: {day_txt}]" if detail else f"[Day-wise: {day_txt}]"
+                detail = base_detail
+        else:
+            # Same slot every day: present it once in full format.
+            time_val = _fmt_slot(s, v["start_time"], v["end_time"],
+                                 bool(v["is_full_day"]))
+            detail = base_detail
         return {
             "date": s,
             "period": period,
-            "time": time_txt,
+            "time": time_val,
             "visit_type": v["visit_type"] or "Abroad",
             "country": v["country"] or v["location"] or "",
             "destination": (v["country"] if (v["visit_type"] or "Abroad") == "Abroad"
@@ -276,7 +354,8 @@ def build_report(year):
         }
 
     details = []
-    for emp in stats:
+    for emp in abroad_stats + [s for s in local_stats
+                               if s["emp_id"] not in {a["emp_id"] for a in abroad_stats}]:
         visits = db.list_visits(year=year, emp_id=emp["emp_id"])
         # skip if no visits (should not happen after filter, but safe)
         if not visits:
@@ -287,13 +366,14 @@ def build_report(year):
             "designation": emp["designation"],
             "visits": [_visit_dict(v) for v in visits],
         })
-    blocked = sum(1 for s in stats if s["status"].startswith("MAX REACHED"))
+    blocked = sum(1 for s in abroad_stats if s["status"].startswith("MAX REACHED"))
     return {
         "year": year,
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "total_employees": len(stats),
+        "total_employees": len({s["emp_id"] for s in abroad_stats + local_stats}),
         "blocked_count": blocked,
-        "stats": stats,
+        "abroad_stats": abroad_stats,
+        "local_stats": local_stats,
         "details": details,
     }
 
@@ -357,10 +437,16 @@ def _tenure_summary_row(s):
             "Active" if s["is_currently_active"] else "Released"]
 
 
-SUMMARY_HEADERS = ["ID", "Name", "Designation", "Type", "Project", "Yearly Limit",
-                   "Visits Used", "Remaining", "Status", "Times Max Reached", "Local Visits"]
+# Abroad statistics carry the yearly limit; Local statistics are plain counts.
+ABROAD_SUMMARY_HEADERS = ["ID", "Name", "Designation", "Type", "Project", "Yearly Limit",
+                          "Abroad Used", "Remaining", "Status", "Times Max Reached"]
+LOCAL_SUMMARY_HEADERS = ["ID", "Name", "Designation", "Type", "Project", "Local Visits"]
 DETAIL_HEADERS = ["Employee ID", "Employee Name", "Type", "Period", "Time",
                   "Destination", "Purpose", "Purpose Title", "Purpose Details"]
+
+# Horizontal-rule style separator between the user's purpose text and the
+# day-by-day time slots in Purpose Details (plain-text <hr> equivalent).
+DAYWISE_SEP = "-" * 40
 
 TENURE_SUMMARY_HEADERS = ["ID", "Name", "Designation", "# Periods", "Total Days", "Total Time",
                           "First Join", "Last Release", "Current Status"]
@@ -368,70 +454,20 @@ TENURE_DETAIL_HEADERS = ["Employee ID", "Employee Name", "Join Date", "Release D
                          "Duration", "Days", "Type", "Project", "Collaborator Org", "Role", "Notes"]
 
 
-def _summary_row(s):
+def _abroad_summary_row(s):
     return [s["emp_id"], s["name"], s["designation"], s["emp_type"], s["project"],
-            s["limit_txt"], s["used"], s["remaining"], s["status"], s["reached"],
-            s.get("local", 0)]
+            s["limit_txt"], s["used"], s["remaining"], s["status"], s["reached"]]
+
+
+def _local_summary_row(s):
+    return [s["emp_id"], s["name"], s["designation"], s["emp_type"], s["project"],
+            s["local"]]
 
 
 def _detail_row(d, v):
     return [d["emp_id"], d["name"], v.get("visit_type", "Abroad"), v.get("period", v.get("date", "")),
             v.get("time", ""), v.get("destination", v.get("country", "")),
             v.get("purpose", ""), v.get("title", ""), v.get("detail", "")]
-
-
-def export_csv(path, year):
-    rep = build_report(year)
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow([ORG_NAME])
-        w.writerow([ORG_SUBTITLE])
-        w.writerow([f"Abroad Visit Report - Year {rep['year']} (Abroad + Local)"])
-        w.writerow([f"Generated: {rep['generated']}",
-                    f"Total employees: {rep['total_employees']}",
-                    f"Reached yearly limit: {rep['blocked_count']}"])
-        w.writerow([])
-        w.writerow(["YEARLY EMPLOYEE STATISTICS"])
-        w.writerow(SUMMARY_HEADERS)
-        for s in rep["stats"]:
-            w.writerow(_summary_row(s))
-        w.writerow([])
-        w.writerow(["VISIT DETAILS"])
-        w.writerow(DETAIL_HEADERS)
-        for d in rep["details"]:
-            if not d["visits"]:
-                w.writerow([d["emp_id"], d["name"], f"(no visits recorded in {year})", "", "", "", "", "", ""])
-                continue
-            for v in d["visits"]:
-                w.writerow(_detail_row(d, v))
-
-
-def export_tenure_csv(path, today=None):
-    rep = build_tenure_report(today)
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow([ORG_NAME])
-        w.writerow([ORG_SUBTITLE])
-        w.writerow([f"Tenure Report - As of {rep['today']}"])
-        w.writerow([f"Generated: {rep['generated']}",
-                    f"Total employees: {rep['total_employees']}",
-                    f"Active: {rep['active_count']}",
-                    f"Released: {rep['released_count']}"])
-        w.writerow([])
-        w.writerow(["TENURE SUMMARY (per employee)"])
-        w.writerow(TENURE_SUMMARY_HEADERS)
-        for s in rep["summaries"]:
-            w.writerow(_tenure_summary_row(s))
-        w.writerow([])
-        w.writerow(["TENURE DETAILS (intervals)"])
-        w.writerow(TENURE_DETAIL_HEADERS)
-        for d in rep["details"]:
-            if not d["intervals"]:
-                w.writerow([d["emp_id"], d["name"], "(no tenure recorded)", "", "", "", "", "", "", "", ""])
-                continue
-            for iv in d["intervals"]:
-                w.writerow([d["emp_id"], d["name"], iv["join"], iv["release"],
-                            iv["duration"], iv["days"], iv["type"], iv["project"], iv["org"], iv["role"], iv["notes"]])
 
 
 def _clean_xml(text):
@@ -447,16 +483,20 @@ def _col_letter(n):
 
 
 def _disp_len(value):
-    width = 0.0
-    for ch in _ILLEGAL_XML.sub("", str(value)):
-        code = ord(ch)
-        if code > 0x1100:
-            width += 2
-        elif code > 126:
-            width += 1.7
-        else:
-            width += 1
-    return int(round(width))
+    # Multi-line cells: width tracks the longest line, not the total.
+    best = 0
+    for line in _ILLEGAL_XML.sub("", str(value)).split("\n"):
+        width = 0.0
+        for ch in line:
+            code = ord(ch)
+            if code > 0x1100:
+                width += 2
+            elif code > 126:
+                width += 1.7
+            else:
+                width += 1
+        best = max(best, int(round(width)))
+    return best
 
 
 def export_xlsx(path, year):
@@ -517,33 +557,44 @@ def export_xlsx(path, year):
             ws[f"A{r}"] = ORG_SUBTITLE
             ws[f"A{r}"].font = subtitle_font
             r+=1
-        ws[f"A{r}"] = f"Abroad Visit Report - Year {rep['year']}"
+        ws[f"A{r}"] = f"Employee Visit Report - Year {rep['year']}"
+
         ws[f"A{r}"].font = Font(name="Calibri", size=13, bold=True, color="006633")
         r+=1
         ws[f"A{r}"] = f"Generated: {rep['generated']}    Total employees: {rep['total_employees']}    Reached yearly limit: {rep['blocked_count']}"
         ws[f"A{r}"].font = Font(name="Calibri", size=9, color="666666")
         r+=1
         r+=1
-        ws[f"A{r}"] = "YEARLY EMPLOYEE STATISTICS"
-        ws[f"A{r}"].font = Font(name="Calibri", size=11, bold=True, color="006633")
-        r+=1
-        # Header
-        for ci, h in enumerate(SUMMARY_HEADERS, start=1):
-            c = ws.cell(row=r, column=ci, value=h)
-            c.font = header_font
-            c.fill = header_fill
-            c.alignment = header_align
-            c.border = thin_border
-        r+=1
-        for s in rep["stats"]:
-            row = _summary_row(s)
-            for ci, v in enumerate(row, start=1):
-                c = ws.cell(row=r, column=ci, value=v)
-                c.font = bold_font if s["status"].startswith("MAX REACHED") else normal_font
-                c.alignment = center_align if ci in (6,7,8,10) else left_align
+        def _stats_table(title, headers, rows, center_cols, bold_rows=()):
+            nonlocal r
+            ws[f"A{r}"] = title
+            ws[f"A{r}"].font = Font(name="Calibri", size=11, bold=True, color="006633")
+            r+=1
+            for ci, h in enumerate(headers, start=1):
+                c = ws.cell(row=r, column=ci, value=h)
+                c.font = header_font
+                c.fill = header_fill
+                c.alignment = header_align
                 c.border = thin_border
             r+=1
-        r+=1
+            for ri, row in enumerate(rows):
+                for ci, v in enumerate(row, start=1):
+                    c = ws.cell(row=r, column=ci, value=v)
+                    c.font = bold_font if ri in bold_rows else normal_font
+                    c.alignment = center_align if ci in center_cols else left_align
+                    c.border = thin_border
+                r+=1
+            r+=1
+        _stats_table("YEARLY ABROAD STATISTICS (yearly limit applies)",
+                     ABROAD_SUMMARY_HEADERS,
+                     [_abroad_summary_row(s) for s in rep["abroad_stats"]],
+                     center_cols=(6, 7, 8, 10),
+                     bold_rows={i for i, s in enumerate(rep["abroad_stats"])
+                                if s["status"].startswith("MAX REACHED")})
+        _stats_table("YEARLY LOCAL STATISTICS (no limit)",
+                     LOCAL_SUMMARY_HEADERS,
+                     [_local_summary_row(s) for s in rep["local_stats"]],
+                     center_cols=(6,))
         ws[f"A{r}"] = "VISIT DETAILS"
         ws[f"A{r}"].font = Font(name="Calibri", size=11, bold=True, color="006633")
         r+=1
@@ -636,15 +687,20 @@ def export_xlsx(path, year):
     else:
         add_row([ORG_NAME], style=2, fit=False)
         add_row([ORG_SUBTITLE], style=1, fit=False)
-    add_row([f"Abroad Visit Report - Year {rep['year']}"], style=2, fit=False)
+    add_row([f"Employee Visit Report - Year {rep['year']}"], style=2, fit=False)
     add_row([f"Generated: {rep['generated']}",
              f"Total employees: {rep['total_employees']}",
              f"Reached yearly limit: {rep['blocked_count']}"], fit=False)
     add_row([""])
-    add_row(["YEARLY EMPLOYEE STATISTICS"], style=1, fit=False)
-    add_row(SUMMARY_HEADERS, style=1)
-    for s in rep["stats"]:
-        add_row(_summary_row(s), numeric_cols=(5,))
+    add_row(["YEARLY ABROAD STATISTICS (yearly limit applies)"], style=1, fit=False)
+    add_row(ABROAD_SUMMARY_HEADERS, style=1)
+    for s in rep["abroad_stats"]:
+        add_row(_abroad_summary_row(s), numeric_cols=(5,))
+    add_row([""])
+    add_row(["YEARLY LOCAL STATISTICS (no limit)"], style=1, fit=False)
+    add_row(LOCAL_SUMMARY_HEADERS, style=1)
+    for s in rep["local_stats"]:
+        add_row(_local_summary_row(s))
     add_row([""])
     add_row(["VISIT DETAILS"], style=1, fit=False)
     add_row(DETAIL_HEADERS, style=1)
@@ -1030,33 +1086,39 @@ def _pdf_escape(text):
 
 
 def _wrap_pdf(text, max_w, measure, size):
-    raw = _ILLEGAL_XML.sub("", str(text)).replace("\n", " ").strip()
+    # Preserve explicit line breaks so day-by-day slots render line by line.
+    raw = _ILLEGAL_XML.sub("", str(text))
+    out = []
 
     def fits(t):
         return measure(t, size) <= max_w
 
-    out = []
-    cur = ""
-    for word in raw.split():
-        while word and not fits(word):
-            piece = word[0]
-            i = 1
-            while i < len(word) and fits(piece + word[i]):
-                piece += word[i]
-                i += 1
-            if cur:
+    for raw_line in raw.split("\n"):
+        seg = raw_line.strip()
+        if not seg:
+            out.append("")
+            continue
+        cur = ""
+        for word in seg.split():
+            while word and not fits(word):
+                piece = word[0]
+                i = 1
+                while i < len(word) and fits(piece + word[i]):
+                    piece += word[i]
+                    i += 1
+                if cur:
+                    out.append(cur)
+                    cur = ""
+                out.append(piece)
+                word = word[i:]
+            cand = f"{cur} {word}".strip() if cur else word
+            if fits(cand):
+                cur = cand
+            else:
                 out.append(cur)
-                cur = ""
-            out.append(piece)
-            word = word[i:]
-        cand = f"{cur} {word}".strip() if cur else word
-        if fits(cand):
-            cur = cand
-        else:
+                cur = word
+        if cur:
             out.append(cur)
-            cur = word
-    if cur:
-        out.append(cur)
     return out or [""]
 
 
@@ -1410,10 +1472,12 @@ class _PdfDoc:
 
 
 class _PdfReport:
-    COLS_SUMMARY = [("ID", 55), ("Name", 125), ("Designation", 90), ("Type", 65), ("Project", 100),
-                    ("Limit", 42), ("Used", 40), ("Remaining", 68), ("Status", 95), ("Times Max Reached", 90)]
-    COLS_DETAIL = [("Type", 55), ("Period", 105), ("Time", 70), ("Destination", 95),
-                   ("Purpose", 70), ("Purpose Title", 130), ("Purpose Details", 245)]
+    COLS_ABROAD_SUMMARY = [("ID", 55), ("Name", 125), ("Designation", 90), ("Type", 65), ("Project", 100),
+                           ("Limit", 42), ("Used", 40), ("Remaining", 68), ("Status", 95), ("Times Max Reached", 90)]
+    COLS_LOCAL_SUMMARY = [("ID", 60), ("Name", 150), ("Designation", 140), ("Type", 90),
+                          ("Project", 200), ("Local Visits", 130)]
+    COLS_DETAIL = [("Type", 45), ("Period", 135), ("Time", 105), ("Destination", 85),
+                   ("Purpose", 60), ("Purpose Title", 120), ("Purpose Details", 220)]
     BODY = 8
     HEAD = 8.5
     LEAD = 11
@@ -1421,7 +1485,7 @@ class _PdfReport:
     def __init__(self, rep):
         self.rep = rep
         needed = set()
-        for s in rep["stats"]:
+        for s in rep["abroad_stats"] + rep["local_stats"]:
             for v in s.values():
                 needed.update(ord(c) for c in str(v))
         for d in rep["details"]:
@@ -1478,14 +1542,14 @@ class _PdfReport:
         self.page_no += 1
         self._draw_header()
         if first:
-            self.doc.text(0, 62, 11, f"Abroad Visit Report - Year {self.rep['year']}", bold=True)
+            self.doc.text(0, 62, 11, f"Employee Visit Report - Year {self.rep['year']}", bold=True)
             meta = (f"Generated: {_fmt_generated(self.rep['generated'])}    Total employees: {self.rep['total_employees']}    "
                     f"Reached yearly limit: {self.rep['blocked_count']}")
             self.doc.text(0, 72, 8, meta, gray=0.35)
             self.doc.line(0, 80, PAGE_W - 2 * _MARGIN, 82)
             self.y = 96
         else:
-            self.doc.text(0, 60, 9, f"Abroad Visit Report - Year {self.rep['year']} (continued)", bold=True)
+            self.doc.text(0, 60, 9, f"Employee Visit Report - Year {self.rep['year']} (continued)", bold=True)
             self.doc.line(0, 66, PAGE_W - 2 * _MARGIN, 66)
             self.y = 78
         self._draw_footer()
@@ -1535,13 +1599,20 @@ class _PdfReport:
 
     def write(self):
         self._start_page(first=True)
-        self._section_title("YEARLY EMPLOYEE STATISTICS")
-        self._table_header(self.COLS_SUMMARY)
-        for s in self.rep["stats"]:
+        self._section_title("YEARLY ABROAD STATISTICS (yearly limit applies)")
+        self._table_header(self.COLS_ABROAD_SUMMARY)
+        for s in self.rep["abroad_stats"]:
             row = [s["emp_id"], s["name"], s["designation"], s["emp_type"], s["project"],
                    s["limit_txt"], s["used"], s["remaining"], s["status"], s["reached"]]
             bold = s["status"].startswith("MAX REACHED")
-            self._draw_row(self.COLS_SUMMARY, [str(c) for c in row], bold=bold)
+            self._draw_row(self.COLS_ABROAD_SUMMARY, [str(c) for c in row], bold=bold)
+        self.y += 14
+        self._section_title("YEARLY LOCAL STATISTICS (no limit)")
+        self._table_header(self.COLS_LOCAL_SUMMARY)
+        for s in self.rep["local_stats"]:
+            row = [s["emp_id"], s["name"], s["designation"], s["emp_type"], s["project"],
+                   s["local"]]
+            self._draw_row(self.COLS_LOCAL_SUMMARY, [str(c) for c in row])
         self.y += 14
         self._section_title("VISIT DETAILS")
         for d in self.rep["details"]:
@@ -1557,8 +1628,8 @@ class _PdfReport:
             for v in d["visits"]:
                 self._draw_row(self.COLS_DETAIL, [
                     v.get("visit_type", "Abroad"),
-                    _fmt_date(v.get("period", v.get("date", ""))),
-                    v.get("time", ""),
+                    v.get("period", v.get("date", "")),
+                    _pdf_time_groups(v.get("time", "")),
                     v.get("destination", v.get("country", "")),
                     v.get("purpose", ""),
                     v.get("title", ""),

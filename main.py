@@ -8,6 +8,7 @@ from PIL import Image, ImageTk
 import db
 import auth
 import reporting
+from reporting import _fmt_datetime, _fmt_date, _fmt_period, _fmt_slot
 from countries import COUNTRIES
 try:
     import turso_sync  # type: ignore
@@ -1024,7 +1025,7 @@ class App(tk.Tk):
     def __init__(self, current_user=None):
         super().__init__()
         self.current_user = current_user  # sqlite Row from app_users
-        self.title("Employee Information & Abroad Visit Tracker - IEDCR")
+        self.title("Employee Information & Visit Tracker - IEDCR")
         try:
             self.state("zoomed")
         except tk.TclError:
@@ -1303,7 +1304,7 @@ class App(tk.Tk):
             ("id", "#", 45, "center"),
             ("type", "Type", 70, "center"),
             ("period", "Period", 150, "center"),
-            ("time", "Time", 110, "center"),
+            ("time", "Time", 160, "center"),
             ("emp_id", "Emp ID", 70, "w"),
             ("emp_name", "Employee", 120, "w"),
             ("dest", "Destination", 120, "w"),
@@ -1317,7 +1318,8 @@ class App(tk.Tk):
 
     def _build_summary_tab(self):
         tab = self.tab_summary
-        tab.rowconfigure(2, weight=1)
+        tab.rowconfigure(3, weight=3)
+        tab.rowconfigure(5, weight=2)
         tab.columnconfigure(0, weight=1)
 
         top = ttk.Frame(tab)
@@ -1333,14 +1335,16 @@ class App(tk.Tk):
         ttk.Label(top, text="Report:").pack(side="left")
         ttk.Button(top, text="Export PDF", command=self.export_report_pdf).pack(side="left", padx=3)
         ttk.Button(top, text="Export Excel", command=self.export_report_excel).pack(side="left", padx=3)
-        ttk.Button(top, text="Export CSV", command=self.export_report_csv).pack(side="left", padx=3)
         ttk.Button(top, text="Print Report", command=self.print_report).pack(side="left", padx=3)
 
         self.summary_totals_var = tk.StringVar(value="")
         ttk.Label(tab, textvariable=self.summary_totals_var, font=("Segoe UI", 10, "bold")).grid(
             row=1, column=0, sticky="w", pady=(0, 6))
 
-        cols = [
+        # Abroad statistics: yearly limit applies here.
+        ttk.Label(tab, text="Abroad statistics (yearly limit applies)",
+                  font=("Segoe UI", 10, "bold")).grid(row=2, column=0, sticky="w", pady=(0, 4))
+        abroad_cols = [
             ("emp_id", "ID", 75, "w"),
             ("name", "Name", 130, "w"),
             ("designation", "Designation", 105, "w"),
@@ -1348,13 +1352,26 @@ class App(tk.Tk):
             ("project_name", "Project", 115, "w"),
             ("limit", "Abroad Limit", 80, "center"),
             ("used", f"Abroad ({current_year})", 90, "center"),
-            ("local", f"Local ({current_year})", 90, "center"),
             ("remaining", "Remaining", 80, "center"),
             ("status", "Status", 150, "w"),
             ("reached", "Times Max Reached", 120, "center"),
         ]
-        frame, self.tree_summary = _make_tree(tab, cols)
-        frame.grid(row=2, column=0, sticky="nsew")
+        frame_a, self.tree_summary_abroad = _make_tree(tab, abroad_cols)
+        frame_a.grid(row=3, column=0, sticky="nsew")
+
+        # Local statistics: no limit, plain counts.
+        ttk.Label(tab, text="Local statistics (no limit)",
+                  font=("Segoe UI", 10, "bold")).grid(row=4, column=0, sticky="w", pady=(8, 4))
+        local_cols = [
+            ("emp_id", "ID", 75, "w"),
+            ("name", "Name", 130, "w"),
+            ("designation", "Designation", 105, "w"),
+            ("emp_type", "Type", 90, "w"),
+            ("project_name", "Project", 115, "w"),
+            ("local", f"Local ({current_year})", 90, "center"),
+        ]
+        frame_l, self.tree_summary_local = _make_tree(tab, local_cols)
+        frame_l.grid(row=5, column=0, sticky="nsew")
 
     def _build_visit_settings_tab(self):
         tab = self.tab_visit_settings
@@ -1431,7 +1448,6 @@ class App(tk.Tk):
         ttk.Label(top, text="Report:").pack(side="left")
         ttk.Button(top, text="Export PDF", command=self.export_tenure_pdf).pack(side="left", padx=3)
         ttk.Button(top, text="Export Excel", command=self.export_tenure_excel).pack(side="left", padx=3)
-        ttk.Button(top, text="Export CSV", command=self.export_tenure_csv).pack(side="left", padx=3)
         ttk.Button(top, text="Print", command=self.print_tenure).pack(side="left", padx=3)
 
         # Tenure details tree (middle)
@@ -1946,20 +1962,23 @@ class App(tk.Tk):
         for r in rows:
             s = r["start_date"] or r["visit_date"]
             e = r["end_date"] or s
-            period = s if s == e else f"{s} -> {e}"
+            period = _fmt_period(s, e)
             try:
                 mode = r["time_mode"] if "time_mode" in r.keys() else "fixed"
             except Exception:
                 mode = "fixed"
             if (mode or "fixed") == "per_day":
                 try:
-                    t = db.visit_time_summary(dict(r))
+                    day_rows = [dict(r) for r in db.list_visit_days(r["id"])]
                 except Exception:
-                    t = "per-day"
-            elif r["is_full_day"]:
-                t = f"Full day {r['start_time']}-{r['end_time']}" if r["start_time"] else "Full day"
-            elif r["start_time"] or r["end_time"]:
-                t = f"{r['start_time']}-{r['end_time']}".strip("-")
+                    day_rows = []
+                t = "; ".join(
+                    _fmt_slot(d["day_date"], d["start_time"], d["end_time"],
+                              bool(d["is_full_day"]))
+                    for d in day_rows
+                ) if day_rows else "per-day"
+            elif r["start_time"] or r["end_time"] or r["is_full_day"]:
+                t = _fmt_slot(s, r["start_time"], r["end_time"], bool(r["is_full_day"]))
             else:
                 t = "-"
             dest = r["country"] if (r["visit_type"] or "Abroad") == "Abroad" else (r["location"] or "-")
@@ -1980,32 +1999,46 @@ class App(tk.Tk):
         year = self.summary_year_var.get() or str(datetime.date.today().year)
         rows = db.summary(year)
         try:
-            self.tree_summary.heading("used", text=f"Abroad ({year})")
-            self.tree_summary.heading("local", text=f"Local ({year})")
+            self.tree_summary_abroad.heading("used", text=f"Abroad ({year})")
+            self.tree_summary_local.heading("local", text=f"Local ({year})")
         except Exception:
             pass
-        self.tree_summary.delete(*self.tree_summary.get_children())
+        self.tree_summary_abroad.delete(*self.tree_summary_abroad.get_children())
+        self.tree_summary_local.delete(*self.tree_summary_local.get_children())
         blocked_count = 0
+        abroad_total = 0
+        local_total = 0
         for r in rows:
             limit = r["max_visits"]
             used = r["used_this_year"]
             local = r["local_this_year"] if "local_this_year" in r.keys() else 0
-            if limit == 0:
-                remaining, status = "Unlimited", "Unlimited visits"
-            elif used >= limit:
-                remaining, status = "0", "MAX REACHED - blocked"
-                blocked_count += 1
-            else:
-                remaining, status = str(limit - used), f"{limit - used} visit(s) left"
-            self.tree_summary.insert("", "end", iid=r["emp_id"], values=(
-                r["emp_id"], r["name"], r["designation"],
-                r["emp_type"] or "", r["project_name"] or "",
-                "Unlimited" if limit == 0 else limit,
-                used, local, remaining, status, r["times_max_reached"],
-            ))
+            common = (r["emp_id"], r["name"], r["designation"],
+                      r["emp_type"] or "", r["project_name"] or "")
+            # Abroad segment: yearly limit applies.
+            if used > 0:
+                abroad_total += used
+                if limit == 0:
+                    remaining, status = "Unlimited", "Unlimited visits"
+                elif used >= limit:
+                    remaining, status = "0", "MAX REACHED - blocked"
+                    blocked_count += 1
+                else:
+                    remaining, status = str(limit - used), f"{limit - used} visit(s) left"
+                self.tree_summary_abroad.insert("", "end", iid=r["emp_id"], values=(
+                    *common,
+                    "Unlimited" if limit == 0 else limit,
+                    used, remaining, status, r["times_max_reached"],
+                ))
+            # Local segment: no limit, plain counts.
+            if local > 0:
+                local_total += local
+                self.tree_summary_local.insert("", "end", iid=r["emp_id"], values=(
+                    *common, local,
+                ))
         total = len(rows)
         self.summary_totals_var.set(
-            f"{blocked_count} of {total} employee(s) have reached their maximum abroad-visit limit in {year}. (Local visits are unlimited.)"
+            f"{blocked_count} of {total} employee(s) reached the abroad-visit limit in {year} "
+            f"(abroad: {abroad_total}, local: {local_total}). Local visits are unlimited."
         )
 
     def update_usage_panel(self):
@@ -2042,7 +2075,7 @@ class App(tk.Tk):
         for v in db.list_visits(year=year, emp_id=emp["emp_id"]):
             s = v["start_date"] or v["visit_date"]
             e = v["end_date"] or s
-            period = s if s == e else f"{s}->{e}"
+            period = _fmt_period(s, e)
             dest = v["country"] if (v["visit_type"] or "Abroad") == "Abroad" else (v["location"] or "-")
             self.tree_usage.insert("", "end", values=(period, v["visit_type"] or "Abroad", dest, v["purpose_title"]))
 
@@ -2151,9 +2184,6 @@ class App(tk.Tk):
             except OSError as exc:
                 messagebox.showerror("Cannot open file", str(exc), parent=self)
 
-    def export_report_csv(self):
-        self._save_report(".csv", ("CSV file", "*.csv"), reporting.export_csv)
-
     def export_report_excel(self):
         self._save_report(".xlsx", ("Excel workbook", "*.xlsx"), reporting.export_xlsx)
 
@@ -2205,9 +2235,6 @@ class App(tk.Tk):
                 os.startfile(path)
             except OSError as exc:
                 messagebox.showerror("Cannot open file", str(exc), parent=self)
-
-    def export_tenure_csv(self):
-        self._save_tenure_report(".csv", ("CSV file", "*.csv"), reporting.export_tenure_csv)
 
     def export_tenure_excel(self):
         self._save_tenure_report(".xlsx", ("Excel workbook", "*.xlsx"), reporting.export_tenure_xlsx)
@@ -2418,6 +2445,10 @@ class App(tk.Tk):
         _run_app_with_auth()
 
     def _on_close(self):
+        if not messagebox.askyesno("Confirm exit",
+                                   "Are you sure you want to close the application?",
+                                   parent=self):
+            return
         try:
             if _HAS_TURSO and turso_sync is not None:
                 try:
