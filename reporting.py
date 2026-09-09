@@ -208,8 +208,9 @@ def build_report(year):
     for r in db.summary(year):
         limit = r["max_visits"]
         used = r["used_this_year"]
-        # skip employees with no visits in this year
-        if used == 0:
+        local = r["local_this_year"] if "local_this_year" in r.keys() else 0
+        # include employees with abroad OR local visits in this year
+        if used == 0 and local == 0:
             continue
         remaining, status, reached = _status_fields(limit, used, r["times_max_reached"])
         stats.append({
@@ -220,10 +221,60 @@ def build_report(year):
             "project": r["project_name"] or "",
             "limit_txt": "Unlimited" if limit == 0 else str(limit),
             "used": used,
+            "local": local,
             "remaining": remaining,
             "status": status,
             "reached": reached,
         })
+    def _visit_dict(v):
+        s = v["start_date"] or v["visit_date"]
+        e = v["end_date"] or s
+        period = s if s == e else f"{s} -> {e}"
+        try:
+            mode = v["time_mode"] if "time_mode" in v.keys() else "fixed"
+        except Exception:
+            mode = "fixed"
+        if (mode or "fixed") == "per_day":
+            try:
+                time_txt = db.visit_time_summary(dict(v))
+            except Exception:
+                time_txt = "per-day"
+            try:
+                day_rows = [dict(r) for r in db.list_visit_days(v["id"])]
+            except Exception:
+                day_rows = []
+            parts = []
+            for d in day_rows:
+                slot = f"{d['start_time']}-{d['end_time']}".strip("-") if (d["start_time"] or d["end_time"]) else "off"
+                if d["is_full_day"] and (d["start_time"] or d["end_time"]):
+                    slot = f"full {slot}"
+                bit = f"{d['day_date'][5:]}: {slot}"
+                if d["note"]:
+                    bit += f" ({d['note']})"
+                parts.append(bit)
+            day_txt = "; ".join(parts)
+        else:
+            if v["start_time"] or v["end_time"]:
+                time_txt = f"{v['start_time']}-{v['end_time']}".strip("-")
+            else:
+                time_txt = "Full day" if v["is_full_day"] else ""
+            day_txt = ""
+        detail = v["purpose_detail"] or ""
+        if day_txt:
+            detail = f"{detail} [Day-wise: {day_txt}]" if detail else f"[Day-wise: {day_txt}]"
+        return {
+            "date": s,
+            "period": period,
+            "time": time_txt,
+            "visit_type": v["visit_type"] or "Abroad",
+            "country": v["country"] or v["location"] or "",
+            "destination": (v["country"] if (v["visit_type"] or "Abroad") == "Abroad"
+                            else (v["location"] or "")),
+            "purpose": v["purpose_name"] or "",
+            "title": v["purpose_title"],
+            "detail": detail,
+        }
+
     details = []
     for emp in stats:
         visits = db.list_visits(year=year, emp_id=emp["emp_id"])
@@ -234,15 +285,7 @@ def build_report(year):
             "emp_id": emp["emp_id"],
             "name": emp["name"],
             "designation": emp["designation"],
-            "visits": [
-                {
-                    "date": v["visit_date"],
-                    "country": v["country"],
-                    "title": v["purpose_title"],
-                    "detail": v["purpose_detail"],
-                }
-                for v in visits
-            ],
+            "visits": [_visit_dict(v) for v in visits],
         })
     blocked = sum(1 for s in stats if s["status"].startswith("MAX REACHED"))
     return {
@@ -315,8 +358,9 @@ def _tenure_summary_row(s):
 
 
 SUMMARY_HEADERS = ["ID", "Name", "Designation", "Type", "Project", "Yearly Limit",
-                   "Visits Used", "Remaining", "Status", "Times Max Reached"]
-DETAIL_HEADERS = ["Employee ID", "Employee Name", "Date", "Country", "Purpose Title", "Purpose Details"]
+                   "Visits Used", "Remaining", "Status", "Times Max Reached", "Local Visits"]
+DETAIL_HEADERS = ["Employee ID", "Employee Name", "Type", "Period", "Time",
+                  "Destination", "Purpose", "Purpose Title", "Purpose Details"]
 
 TENURE_SUMMARY_HEADERS = ["ID", "Name", "Designation", "# Periods", "Total Days", "Total Time",
                           "First Join", "Last Release", "Current Status"]
@@ -326,7 +370,14 @@ TENURE_DETAIL_HEADERS = ["Employee ID", "Employee Name", "Join Date", "Release D
 
 def _summary_row(s):
     return [s["emp_id"], s["name"], s["designation"], s["emp_type"], s["project"],
-            s["limit_txt"], s["used"], s["remaining"], s["status"], s["reached"]]
+            s["limit_txt"], s["used"], s["remaining"], s["status"], s["reached"],
+            s.get("local", 0)]
+
+
+def _detail_row(d, v):
+    return [d["emp_id"], d["name"], v.get("visit_type", "Abroad"), v.get("period", v.get("date", "")),
+            v.get("time", ""), v.get("destination", v.get("country", "")),
+            v.get("purpose", ""), v.get("title", ""), v.get("detail", "")]
 
 
 def export_csv(path, year):
@@ -335,7 +386,7 @@ def export_csv(path, year):
         w = csv.writer(f)
         w.writerow([ORG_NAME])
         w.writerow([ORG_SUBTITLE])
-        w.writerow([f"Abroad Visit Report - Year {rep['year']}"])
+        w.writerow([f"Abroad Visit Report - Year {rep['year']} (Abroad + Local)"])
         w.writerow([f"Generated: {rep['generated']}",
                     f"Total employees: {rep['total_employees']}",
                     f"Reached yearly limit: {rep['blocked_count']}"])
@@ -349,10 +400,10 @@ def export_csv(path, year):
         w.writerow(DETAIL_HEADERS)
         for d in rep["details"]:
             if not d["visits"]:
-                w.writerow([d["emp_id"], d["name"], f"(no visits recorded in {year})", "", "", ""])
+                w.writerow([d["emp_id"], d["name"], f"(no visits recorded in {year})", "", "", "", "", "", ""])
                 continue
             for v in d["visits"]:
-                w.writerow([d["emp_id"], d["name"], v["date"], v["country"], v["title"], v["detail"]])
+                w.writerow(_detail_row(d, v))
 
 
 def export_tenure_csv(path, today=None):
@@ -511,7 +562,7 @@ def export_xlsx(path, year):
                 r+=1
                 continue
             for v in d["visits"]:
-                vals = [d["emp_id"], d["name"], v["date"], v["country"], v["title"], v["detail"]]
+                vals = _detail_row(d, v)
                 for ci, val in enumerate(vals, start=1):
                     c = ws.cell(row=r, column=ci, value=val)
                     c.font = normal_font
@@ -599,10 +650,10 @@ def export_xlsx(path, year):
     add_row(DETAIL_HEADERS, style=1)
     for d in rep["details"]:
         if not d["visits"]:
-            add_row([d["emp_id"], d["name"], f"(no visits recorded in {year})", "", "", ""])
+            add_row([d["emp_id"], d["name"], f"(no visits recorded in {year})", "", "", "", "", "", ""])
             continue
         for v in d["visits"]:
-            add_row([d["emp_id"], d["name"], v["date"], v["country"], v["title"], v["detail"]])
+            add_row(_detail_row(d, v))
 
     cols_xml = "".join(
         f'<col min="{ci}" max="{ci}" width="{min(max(ln * 1.1 + 2, 9), 55):.2f}" customWidth="1"/>'
@@ -1361,7 +1412,8 @@ class _PdfDoc:
 class _PdfReport:
     COLS_SUMMARY = [("ID", 55), ("Name", 125), ("Designation", 90), ("Type", 65), ("Project", 100),
                     ("Limit", 42), ("Used", 40), ("Remaining", 68), ("Status", 95), ("Times Max Reached", 90)]
-    COLS_DETAIL = [("Date", 70), ("Country", 130), ("Purpose Title", 190), ("Purpose Details", 380)]
+    COLS_DETAIL = [("Type", 55), ("Period", 105), ("Time", 70), ("Destination", 95),
+                   ("Purpose", 70), ("Purpose Title", 130), ("Purpose Details", 245)]
     BODY = 8
     HEAD = 8.5
     LEAD = 11
@@ -1503,7 +1555,15 @@ class _PdfReport:
             self.y += 17
             self._table_header_detail()
             for v in d["visits"]:
-                self._draw_row(self.COLS_DETAIL, [_fmt_date(v["date"]), v["country"], v["title"], v["detail"]])
+                self._draw_row(self.COLS_DETAIL, [
+                    v.get("visit_type", "Abroad"),
+                    _fmt_date(v.get("period", v.get("date", ""))),
+                    v.get("time", ""),
+                    v.get("destination", v.get("country", "")),
+                    v.get("purpose", ""),
+                    v.get("title", ""),
+                    v.get("detail", ""),
+                ])
             self.y += 10
 
     def _table_header_detail(self):
