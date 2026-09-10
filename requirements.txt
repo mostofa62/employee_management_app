@@ -1,0 +1,26 @@
+# Runtime dependencies for Employee Visit Tracker (IEDCR)
+# Install: pip install -r requirements.txt
+
+# Core - Tkinter is stdlib, Pillow for logo/images
+pillow>=12.0.0          # Pillow 12.2 tested - logo.png rendering (Image, ImageTk)
+
+# Excel / reporting
+openpyxl>=3.1.0         # Excel export (trusted openpyxl path, avoids "content" warnings)
+
+# PDF - govt logo SVG -> PNG + Unicode shaping for Bengali fonts
+pymupdf>=1.28.0         # renders bangladesh-govt-logo.svg to PNG for PDF/Excel
+uharfbuzz>=0.50.0       # Bengali Unicode shaping for PDF fonts (kalpurush, Nikosh etc.)
+
+# Network - Supabase + Turso sync
+requests>=2.31.0        # Supabase password_resets + Turso Hrana pipeline
+
+# Optional but recommended
+python-dotenv>=1.0.0    # auto-load .env (SUPABASE_API_KEY etc.), fallback to manual .env parsing
+
+# Build only - compile to single-file exe
+pyinstaller>=6.0.0      # PyInstaller bundles + logo.ico, see README "Compile to EXE"
+pyinstaller-hooks-contrib>=2024.0
+
+# Optional extras (not required for normal run):
+# cairosvg>=2.0         # alternative SVG renderer if pymupdf missing
+# reportlab>=4.0        # not used by current PDF engine (kept for compat)

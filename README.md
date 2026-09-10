@@ -67,6 +67,62 @@ python main.py
 - After login, header shows user/role. **Admin** sees **Manage Users** to add/delete users and reset passwords (optionally sync to Supabase).
 - Logout clears `is_logged_in` in DB; close window respects Stay logged in.
 
+## Compile to EXE (Windows - single-file with logo icon)
+
+The app ships with `logo.png` (783x954) used for the exe icon. Icon is auto-generated as `logo.ico` (transparent square, 16/32/48/64/128/256).
+
+### 1) Install dependencies
+
+```powershell
+# create venv (recommended)
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+pip install -r requirements.txt
+# requirements.txt includes: pillow, openpyxl, pymupdf, uharfbuzz, requests,
+# python-dotenv, pyinstaller (see file for versions)
+```
+
+### 2) Generate icon (optional - auto-run by build scripts)
+
+```powershell
+python generate_icon.py
+# or
+py -3 generate_icon.py
+# creates logo.ico (104 KB, 6 sizes) from logo.png
+```
+
+### 3) Build exe
+
+Pick one:
+
+```powershell
+# PowerShell (recommended)
+powershell -ExecutionPolicy Bypass -File build_exe.ps1
+
+# CMD
+build_exe.bat
+
+# Manual
+py -3 -m PyInstaller EmployeeVisitTracker.spec --clean --noconfirm
+```
+
+What it does:
+
+- `generate_icon.py` / build script converts `logo.png` -> `logo.ico` (RGBA square with transparent padding).
+- `EmployeeVisitTracker.spec` bundles: `logo.png`, `logo.svg`, `bangladesh-govt-logo.svg`, `fonts/` (kalpurush.ttf etc.), `logo.ico`; sets `icon=['logo.ico']`, `console=False` (windowed), `--onefile`, `--name EmployeeVisitTracker`, hidden imports `PIL/openpyxl/uharfbuzz/pymupdf/requests`, excludes heavy unused packages (`torch/ultralytics/tensorflow/scipy` etc) to keep size ~47 MB.
+- Output: `dist\EmployeeVisitTracker.exe` - double-click to run (no console). DB `employees.db` is created **beside the exe** (frozen-aware `db.py` uses `sys.executable` parent, not temp `_MEIPASS`).
+- Re-running the build always re-creates `logo.ico` and `dist\EmployeeVisitTracker.exe` (icon + deps via `requirements.txt` + `EmployeeVisitTracker.spec`).
+
+To rebuild after code changes, just re-run `build_exe.ps1` (or `build_exe.bat`). No manual icon step needed.
+
+Files involved:
+
+- `requirements.txt` - runtime + build deps (pyinstaller)
+- `EmployeeVisitTracker.spec` - reproducible PyInstaller config (tracked in git)
+- `generate_icon.py` / `build_exe.ps1` / `build_exe.bat` - helpers that always regenerate `logo.ico`
+- `logo.png` -> `logo.ico` -> embedded exe icon (taskbar, explorer, alt-tab)
+
 ## Environment - Turso Sync (Optional, Recommended for Cloud Backup at turso.tech)
 
 Every write (add/edit/delete employee, visit, tenure, project, org) is auto-synced to Turso when network is available. Offline writes are queued and retried.

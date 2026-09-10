@@ -9,9 +9,19 @@ from contextlib import closing
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+def _get_base_dir():
+    """Return directory for writable files (DB). Handles PyInstaller frozen exe."""
+    import sys
+    # PyInstaller frozen: exe beside writable DB, not _MEIPASS temp
+    if getattr(sys, "frozen", False):
+        # sys.executable is the exe path in onefile/onedir
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 DB_PATH = Path(
     os.environ.get("EMPLOYEE_VISITS_DB")
-    or Path(__file__).resolve().with_name("employees.db")
+    or _get_base_dir() / "employees.db"
 )
 
 _SCHEMA = """
