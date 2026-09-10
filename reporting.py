@@ -15,6 +15,65 @@ ORG_NAME = "Institute of Epidemiology, Disease Control and Research (IEDCR)"
 ORG_SUBTITLE = "Employee Information & Visit Tracker System"
 FOOTER_COURTESY = "Courtesy: This software is developed by Golam Mostofa, Computer Programmer, Chittagong University"
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+GOVT_LOGO_SVG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bangladesh-govt-logo.svg")
+
+_GOVT_PNG_CACHE = {}
+
+
+def _get_govt_logo_png(target_h_px=120):
+    """Render bangladesh-govt-logo.svg to PNG bytes at `target_h_px` height.
+
+    Returns (png_bytes, w, h) composited over white, or None. Results are
+    cached in memory; the SVG is only re-rendered per process once per size.
+    """
+    key = int(target_h_px)
+    if key in _GOVT_PNG_CACHE:
+        return _GOVT_PNG_CACHE[key]
+    if not os.path.isfile(GOVT_LOGO_SVG):
+        return None
+    try:
+        import pymupdf
+        from PIL import Image as _PILImage
+        import io
+        doc = pymupdf.open(GOVT_LOGO_SVG)
+        page = doc[0]
+        rect = page.rect
+        if rect.height <= 0:
+            return None
+        scale = float(target_h_px) / rect.height
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale))
+        mode = "RGBA" if pix.alpha else "RGB"
+        im = _PILImage.frombytes(mode, (pix.width, pix.height), pix.samples)
+        if im.mode == "RGBA":
+            bg = _PILImage.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[3])
+            im = bg
+        elif im.mode != "RGB":
+            im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        out = (buf.getvalue(), im.size[0], im.size[1])
+        _GOVT_PNG_CACHE[key] = out
+        return out
+    except Exception:
+        return None
+
+
+def _get_govt_logo_path(target_h_px=36):
+    """Disk-cached PNG path of the govt logo for openpyxl (needs a filename)."""
+    import tempfile
+    info = _get_govt_logo_png(target_h_px)
+    if info is None:
+        return None
+    png_data, _, _ = info
+    cache = os.path.join(tempfile.gettempdir(), f"iedcr_govt_logo_h{int(target_h_px)}.png")
+    try:
+        if not os.path.isfile(cache) or os.path.getsize(cache) != len(png_data):
+            with open(cache, "wb") as f:
+                f.write(png_data)
+    except Exception:
+        return None
+    return cache
 
 def _export_xlsx_via_openpyxl(path, rep, sheet_title, headers_list, rows_fn):
     """Try openpyxl for trusted, fully compliant XLSX with logo. Returns True if success."""
@@ -196,6 +255,52 @@ def _fmt_generated(dt_str):
         except Exception:
             return dt_str
 
+def _openpyxl_header_logos(ws, XLImage, right_col="G", target_h=44):
+    """Embed IEDCR logo at A1 (left) and govt logo at `<right_col>1` (right).
+
+    Returns True if the left logo was embedded.
+    Row heights are set snug around the two-line banner.
+    """
+    from PIL import Image as _PIL
+    logo_ok = False
+    if os.path.isfile(LOGO_PATH) and LOGO_PATH.lower().endswith(".png"):
+        try:
+            pil = _PIL.open(LOGO_PATH)
+            w, h = pil.size
+            scale = target_h / h if h else 1
+            img = XLImage(LOGO_PATH)
+            img.width = int(w * scale)
+            img.height = target_h
+            ws.add_image(img, "A1")
+            logo_ok = True
+        except Exception:
+            logo_ok = False
+    govt_path = _get_govt_logo_path(target_h)
+    if govt_path:
+        try:
+            gimg = XLImage(govt_path)
+            gimg.width = target_h
+            gimg.height = target_h
+            ws.add_image(gimg, f"{right_col}1")
+        except Exception:
+            pass
+    ws.row_dimensions[1].height = 30
+    ws.row_dimensions[2].height = 16
+    return logo_ok
+
+
+def _frame_row(ws, row, min_col, max_col, color="006633"):
+    """Draw an outer frame (no interior lines) around one header row."""
+    from openpyxl.styles import Border, Side
+    edge = Side(style="thin", color=color)
+    blank = Side()
+    for ci in range(min_col, max_col + 1):
+        ws.cell(row=row, column=ci).border = Border(
+            left=edge if ci == min_col else blank,
+            right=edge if ci == max_col else blank,
+            top=edge, bottom=edge)
+
+
 def _get_excel_logo():
     """Return (png_bytes, cx_emu, cy_emu) for embedding in XLSX, or None if not available."""
     # Use PNG only (SVG was not showing in PDF)
@@ -236,31 +341,82 @@ def _get_excel_logo():
     except Exception:
         return None
 
-def _excel_drawing_xml(cx, cy):
-    return (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
-        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
-        '<xdr:oneCellAnchor>'
-        '<xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
-        f'<xdr:ext cx="{cx}" cy="{cy}"/>'
-        '<xdr:pic>'
-        '<xdr:nvPicPr><xdr:cNvPr id="1" name="Logo"/><xdr:cNvPicPr/></xdr:nvPicPr>'
-        '<xdr:blipFill><a:blip r:embed="rId1" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>'
-        '<a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
-        f'<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
-        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>'
-        '</xdr:pic><xdr:clientData/>'
-        '</xdr:oneCellAnchor></xdr:wsDr>'
-    )
+def _get_govt_excel_logo(target_h_px=36):
+    """Return (png_bytes, cx_emu, cy_emu) for the govt logo, or None."""
+    info = _get_govt_logo_png(target_h_px)
+    if info is None:
+        return None
+    png_data, w, h = info
+    # EMU: 1 inch = 914400, 96 dpi => 1 px = 9525
+    return png_data, w * 9525, h * 9525
 
-def _excel_drawing_rels():
+
+def _excel_drawing_xml(pics):
+    """Build drawing XML for embedded header images.
+
+    pics: list of dicts with keys col, row, cx, cy, rid, name.
+    """
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+    ]
+    for p in pics:
+        parts.append(
+            '<xdr:oneCellAnchor>'
+            f'<xdr:from><xdr:col>{p["col"]}</xdr:col><xdr:colOff>0</xdr:colOff>'
+            f'<xdr:row>{p["row"]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+            f'<xdr:ext cx="{p["cx"]}" cy="{p["cy"]}"/>'
+            '<xdr:pic>'
+            f'<xdr:nvPicPr><xdr:cNvPr id="{p["rid"]}" name="{p["name"]}"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+            f'<xdr:blipFill><a:blip r:embed="rId{p["rid"]}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>'
+            '<a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+            f'<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{p["cx"]}" cy="{p["cy"]}"/></a:xfrm>'
+            '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>'
+            '</xdr:pic><xdr:clientData/>'
+            '</xdr:oneCellAnchor>'
+        )
+    parts.append('</xdr:wsDr>')
+    return "".join(parts)
+
+
+def _excel_pics_and_media(logo_info, govt_col=6):
+    """Combine left logo + right govt logo into drawing pics + media files.
+
+    Returns (pics, media) where pics feeds _excel_drawing_xml and media is a
+    list of (part_name, png_bytes) for the ZIP.
+    """
+    pics, media = [], []
+    if logo_info:
+        png_data, cx, cy = logo_info
+        pics.append({"col": 0, "row": 0, "cx": cx, "cy": cy, "rid": 1, "name": "Logo"})
+        media.append(("xl/media/image1.png", png_data))
+    govt_info = _get_govt_excel_logo()
+    if govt_info:
+        gpng, gcx, gcy = govt_info
+        rid = len(pics) + 1
+        pics.append({"col": govt_col, "row": 0, "cx": gcx, "cy": gcy,
+                     "rid": rid, "name": "GovtLogo"})
+        media.append((f"xl/media/image{rid}.png", gpng))
+    return pics, media
+
+def _excel_drawing_rels(count):
+    rels = "".join(
+        f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+        f'Target="../media/image{i}.png"/>'
+        for i in range(1, count + 1)
+    )
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>'
+        + rels +
         '</Relationships>'
     )
+
+
+# Centered variants for the hand-rolled XLSX styles: {plain_style: centered_style}.
+# xf3 = centered bold-11, xf4 = centered bold-15, xf5 = centered normal-11.
+_FALLBACK_CENTER_STYLE = {None: 5, 1: 3, 2: 4}
 
 
 def _status_fields(limit, used, times_reached):
@@ -512,23 +668,8 @@ def export_xlsx(path, year):
         ws.title = f"Visit Report {rep['year']}"[:31]
         wb.properties.creator = ORG_NAME
         wb.properties.lastModifiedBy = ORG_NAME
-        # Embed logo properly via openpyxl (no manual drawing XML) - ensures Excel shows logo without "external content" prompt
-        logo_ok = False
-        if os.path.isfile(LOGO_PATH) and LOGO_PATH.lower().endswith(".png"):
-            try:
-                pil = _PIL.open(LOGO_PATH)
-                w, h = pil.size
-                target_h = 36
-                scale = target_h / h if h else 1
-                img = XLImage(LOGO_PATH)
-                img.width = int(w * scale)
-                img.height = target_h
-                ws.add_image(img, "A1")
-                ws.row_dimensions[1].height = 28
-                ws.row_dimensions[2].height = 14
-                logo_ok = True
-            except Exception:
-                logo_ok = False
+        # Header: left logo, right govt logo, org text centered between them.
+        logo_ok = _openpyxl_header_logos(ws, XLImage, right_col="G")
         # Styles
         title_font = Font(name="Calibri", size=15, bold=True, color="006633")
         subtitle_font = Font(name="Calibri", size=11, color="444444")
@@ -541,29 +682,28 @@ def export_xlsx(path, year):
         center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
         left_align = Alignment(horizontal="left", vertical="center", wrap_text=True)
         r = 1
-        if logo_ok:
-            ws["B1"] = ORG_NAME
-            ws["B1"].font = title_font
-            ws["B1"].alignment = Alignment(vertical="center")
-            ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=6)
-            ws["B2"] = ORG_SUBTITLE
-            ws["B2"].font = subtitle_font
-            ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=6)
-            r = 3
-        else:
-            ws[f"A{r}"] = ORG_NAME
-            ws[f"A{r}"].font = title_font
-            r+=1
-            ws[f"A{r}"] = ORG_SUBTITLE
-            ws[f"A{r}"].font = subtitle_font
-            r+=1
+        # Single banner band: left logo + org text + right govt logo in one band.
+        # centerContinuous spans the text across the empty framed cells.
+        span_align = Alignment(horizontal="centerContinuous", vertical="center")
+        ws["B1"] = ORG_NAME
+        ws["B1"].font = title_font
+        ws["B1"].alignment = span_align
+        ws["B2"] = ORG_SUBTITLE
+        ws["B2"].font = subtitle_font
+        ws["B2"].alignment = span_align
+        _frame_row(ws, 1, 1, 7)
+        _frame_row(ws, 2, 1, 7)
+        r = 3
         ws[f"A{r}"] = f"Employee Visit Report - Year {rep['year']}"
 
         ws[f"A{r}"].font = Font(name="Calibri", size=13, bold=True, color="006633")
+        ws[f"A{r}"].alignment = span_align
+        _frame_row(ws, r, 1, 10)
         r+=1
         ws[f"A{r}"] = f"Generated: {rep['generated']}    Total employees: {rep['total_employees']}    Reached yearly limit: {rep['blocked_count']}"
         ws[f"A{r}"].font = Font(name="Calibri", size=9, color="666666")
-        r+=1
+        ws[f"A{r}"].alignment = span_align
+        _frame_row(ws, r, 1, 10)
         r+=1
         def _stats_table(title, headers, rows, center_cols, bold_rows=()):
             nonlocal r
@@ -658,6 +798,7 @@ def export_xlsx(path, year):
     except Exception as e:
         pass
     logo_info = _get_excel_logo()
+    pics, pics_media = _excel_pics_and_media(logo_info)
 
     def cell(ref, value, style=None, numeric=False):
         s_attr = f' s="{style}"' if style is not None else ""
@@ -680,18 +821,18 @@ def export_xlsx(path, year):
                     width_map[ci] = ln
         sheet_rows.append(f'<row r="{idx}">' + "".join(parts) + "</row>")
 
-    # Header with logo alignment: if logo, leave A column empty for image, put org name in B
+    # Header: left logo in A, right govt logo, org text centered between them.
+    _C = _FALLBACK_CENTER_STYLE.get
     if logo_info:
-        add_row(["", ORG_NAME], style=2, fit=False)
-        add_row(["", ORG_SUBTITLE], style=1, fit=False)
+        add_row(["", ORG_NAME], style=_C(2), fit=False)
+        add_row(["", ORG_SUBTITLE], style=_C(1), fit=False)
     else:
-        add_row([ORG_NAME], style=2, fit=False)
-        add_row([ORG_SUBTITLE], style=1, fit=False)
-    add_row([f"Employee Visit Report - Year {rep['year']}"], style=2, fit=False)
+        add_row([ORG_NAME], style=_C(2), fit=False)
+        add_row([ORG_SUBTITLE], style=_C(1), fit=False)
+    add_row([f"Employee Visit Report - Year {rep['year']}"], style=_C(2), fit=False)
     add_row([f"Generated: {rep['generated']}",
              f"Total employees: {rep['total_employees']}",
-             f"Reached yearly limit: {rep['blocked_count']}"], fit=False)
-    add_row([""])
+             f"Reached yearly limit: {rep['blocked_count']}"], style=_C(None), fit=False)
     add_row(["YEARLY ABROAD STATISTICS (yearly limit applies)"], style=1, fit=False)
     add_row(ABROAD_SUMMARY_HEADERS, style=1)
     for s in rep["abroad_stats"]:
@@ -716,9 +857,7 @@ def export_xlsx(path, year):
         for ci, ln in sorted(width_map.items())
     )
     cols_xml = f"<cols>{cols_xml}</cols>" if cols_xml else ""
-    logo_info = _get_excel_logo()
-    if logo_info:
-        png_data, cx, cy = logo_info
+    if pics:
         sheet1 = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
@@ -748,16 +887,19 @@ def export_xlsx(path, year):
         '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>'
         '<borders count="1"><border/></borders>'
         '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="3">'
+        '<cellXfs count="6">'
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
         '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
         '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
         '</cellXfs>'
         '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
         '</styleSheet>'
     )
 
-    if logo_info:
+    if pics:
         content_types = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
@@ -812,11 +954,11 @@ def export_xlsx(path, year):
         z.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
         z.writestr("xl/styles.xml", styles)
         z.writestr("xl/worksheets/sheet1.xml", sheet1)
-        if logo_info:
-            png_data, cx, cy = logo_info
-            z.writestr("xl/media/image1.png", png_data)
-            z.writestr("xl/drawings/drawing1.xml", _excel_drawing_xml(cx, cy))
-            z.writestr("xl/drawings/_rels/drawing1.xml.rels", _excel_drawing_rels())
+        if pics:
+            for part_name, png_data in pics_media:
+                z.writestr(part_name, png_data)
+            z.writestr("xl/drawings/drawing1.xml", _excel_drawing_xml(pics))
+            z.writestr("xl/drawings/_rels/drawing1.xml.rels", _excel_drawing_rels(len(pics)))
             z.writestr("xl/worksheets/_rels/sheet1.xml.rels",
                        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
@@ -837,21 +979,7 @@ def export_tenure_xlsx(path, today=None):
         ws.title = "Tenure Report"[:31]
         wb.properties.creator = ORG_NAME
         wb.properties.lastModifiedBy = ORG_NAME
-        logo_ok = False
-        if os.path.isfile(LOGO_PATH) and LOGO_PATH.lower().endswith(".png"):
-            try:
-                pil = _PIL.open(LOGO_PATH)
-                w, h = pil.size
-                target_h = 36
-                scale = target_h / h if h else 1
-                img = XLImage(LOGO_PATH)
-                img.width = int(w * scale)
-                img.height = target_h
-                ws.add_image(img, "A1")
-                ws.row_dimensions[1].height = 28
-                ws.row_dimensions[2].height = 14
-                logo_ok = True
-            except: logo_ok=False
+        logo_ok = _openpyxl_header_logos(ws, XLImage, right_col="G")
         title_font = Font(name="Calibri", size=15, bold=True, color="006633")
         subtitle_font = Font(name="Calibri", size=11, color="444444")
         header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
@@ -862,15 +990,15 @@ def export_tenure_xlsx(path, today=None):
         left_align = Alignment(horizontal="left", vertical="center", wrap_text=True)
         center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
         r=1
-        if logo_ok:
-            ws["B1"]=ORG_NAME; ws["B1"].font=title_font; ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=6)
-            ws["B2"]=ORG_SUBTITLE; ws["B2"].font=subtitle_font; ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=6)
-            r=3
-        else:
-            ws[f"A{r}"]=ORG_NAME; ws[f"A{r}"].font=title_font; r+=1
-            ws[f"A{r}"]=ORG_SUBTITLE; ws[f"A{r}"].font=subtitle_font; r+=1
-        ws[f"A{r}"]=f"Tenure Report - As of {rep['today']}"; ws[f"A{r}"].font=Font(name="Calibri", size=13, bold=True, color="006633"); r+=1
-        ws[f"A{r}"]=f"Generated: {rep['generated']}    Total employees: {rep['total_employees']}    Active: {rep['active_count']}    Released: {rep['released_count']}"; ws[f"A{r}"].font=Font(name="Calibri", size=9, color="666666"); r+=2
+        tenure_span = Alignment(horizontal="centerContinuous", vertical="center")
+        r=1
+        ws["B1"]=ORG_NAME; ws["B1"].font=title_font; ws["B1"].alignment=tenure_span
+        ws["B2"]=ORG_SUBTITLE; ws["B2"].font=subtitle_font; ws["B2"].alignment=tenure_span
+        _frame_row(ws, 1, 1, 7)
+        _frame_row(ws, 2, 1, 7)
+        r=3
+        ws[f"A{r}"]=f"Tenure Report - As of {rep['today']}"; ws[f"A{r}"].font=Font(name="Calibri", size=13, bold=True, color="006633"); ws[f"A{r}"].alignment=tenure_span; _frame_row(ws, r, 1, 11); r+=1
+        ws[f"A{r}"]=f"Generated: {rep['generated']}    Total employees: {rep['total_employees']}    Active: {rep['active_count']}    Released: {rep['released_count']}"; ws[f"A{r}"].font=Font(name="Calibri", size=9, color="666666"); ws[f"A{r}"].alignment=tenure_span; _frame_row(ws, r, 1, 11); r+=1
         ws[f"A{r}"]="TENURE SUMMARY (per employee)"; ws[f"A{r}"].font=Font(name="Calibri", size=11, bold=True, color="006633"); r+=1
         for ci,h in enumerate(TENURE_SUMMARY_HEADERS, start=1):
             c=ws.cell(row=r, column=ci, value=h); c.font=header_font; c.fill=header_fill; c.alignment=header_align; c.border=thin_border
@@ -923,6 +1051,7 @@ def export_tenure_xlsx(path, today=None):
     except Exception:
         pass
     logo_info = _get_excel_logo()
+    pics, pics_media = _excel_pics_and_media(logo_info)
     def cell(ref, value, style=None, numeric=False):
         s_attr = f' s="{style}"' if style is not None else ""
         if numeric and isinstance(value, (int, float)):
@@ -941,18 +1070,19 @@ def export_tenure_xlsx(path, today=None):
                 if ln > width_map.get(ci, 0):
                     width_map[ci] = ln
         sheet_rows.append(f'<row r="{idx}">' + "".join(parts) + "</row>")
+        # Header: left logo in A, right govt logo, org text centered between them.
+    _C = _FALLBACK_CENTER_STYLE.get
     if logo_info:
-        add_row(["", ORG_NAME], style=2, fit=False)
-        add_row(["", ORG_SUBTITLE], style=1, fit=False)
+        add_row(["", ORG_NAME], style=_C(2), fit=False)
+        add_row(["", ORG_SUBTITLE], style=_C(1), fit=False)
     else:
-        add_row([ORG_NAME], style=2, fit=False)
-        add_row([ORG_SUBTITLE], style=1, fit=False)
-    add_row([f"Tenure Report - As of {rep['today']}"], style=2, fit=False)
+        add_row([ORG_NAME], style=_C(2), fit=False)
+        add_row([ORG_SUBTITLE], style=_C(1), fit=False)
+    add_row([f"Tenure Report - As of {rep['today']}"], style=_C(2), fit=False)
     add_row([f"Generated: {rep['generated']}",
              f"Total employees: {rep['total_employees']}",
              f"Active: {rep['active_count']}",
-             f"Released: {rep['released_count']}"], fit=False)
-    add_row([""])
+             f"Released: {rep['released_count']}"], style=_C(None), fit=False)
     add_row(["TENURE SUMMARY (per employee)"], style=1, fit=False)
     add_row(TENURE_SUMMARY_HEADERS, style=1)
     for s in rep["summaries"]:
@@ -973,9 +1103,7 @@ def export_tenure_xlsx(path, today=None):
         for ci, ln in sorted(width_map.items())
     )
     cols_xml = f"<cols>{cols_xml}</cols>" if cols_xml else ""
-    logo_info = _get_excel_logo()
-    if logo_info:
-        png_data, cx, cy = logo_info
+    if pics:
         sheet1 = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
@@ -1004,15 +1132,18 @@ def export_tenure_xlsx(path, today=None):
         '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>'
         '<borders count="1"><border/></borders>'
         '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="3">'
+        '<cellXfs count="6">'
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
         '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
         '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
         '</cellXfs>'
         '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
         '</styleSheet>'
     )
-    if logo_info:
+    if pics:
         content_types = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
@@ -1063,11 +1194,11 @@ def export_tenure_xlsx(path, today=None):
         z.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
         z.writestr("xl/styles.xml", styles)
         z.writestr("xl/worksheets/sheet1.xml", sheet1)
-        if logo_info:
-            png_data, cx, cy = logo_info
-            z.writestr("xl/media/image1.png", png_data)
-            z.writestr("xl/drawings/drawing1.xml", _excel_drawing_xml(cx, cy))
-            z.writestr("xl/drawings/_rels/drawing1.xml.rels", _excel_drawing_rels())
+        if pics:
+            for part_name, png_data in pics_media:
+                z.writestr(part_name, png_data)
+            z.writestr("xl/drawings/drawing1.xml", _excel_drawing_xml(pics))
+            z.writestr("xl/drawings/_rels/drawing1.xml.rels", _excel_drawing_rels(len(pics)))
             z.writestr("xl/worksheets/_rels/sheet1.xml.rels",
                        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
@@ -1313,7 +1444,12 @@ class _PdfDoc:
         self._logo_w = 0
         self._logo_h = 0
         self._logo_obj_id = None
+        self._govt_raw = None
+        self._govt_w = 0
+        self._govt_h = 0
+        self._govt_obj_id = None
         self._try_load_logo()
+        self._try_load_govt()
 
     def _try_load_logo(self):
         # PDF: use PNG only (SVG was not showing)
@@ -1343,6 +1479,26 @@ class _PdfDoc:
             self._logo_raw_uncompressed_len = len(raw)
         except Exception:
             self._logo_raw = None
+
+    def _try_load_govt(self):
+        # Right-side Bangladesh govt logo (SVG -> PNG, composited over white)
+        try:
+            info = _get_govt_logo_png(220)
+            if info is None:
+                return
+            from PIL import Image as _PILImage
+            import io
+            png_data, _, _ = info
+            im = _PILImage.open(io.BytesIO(png_data))
+            if im.mode != "RGB":
+                im = im.convert("RGB")
+            max_px = 260
+            if max(im.size) > max_px:
+                im.thumbnail((max_px, max_px), _PILImage.Resampling.LANCZOS)
+            self._govt_w, self._govt_h = im.size
+            self._govt_raw = zlib.compress(im.tobytes())
+        except Exception:
+            self._govt_raw = None
 
     def _new_page(self):
         self._ops = []
@@ -1376,12 +1532,24 @@ class _PdfDoc:
     def rect_fill(self, x_top, y_top, w, h, gray=0.9):
         self._ops.append(f"{gray} g {_MARGIN + x_top:.1f} {PAGE_H - y_top - h:.1f} {w:.1f} {h:.1f} re f 0 g")
 
+    def rect_stroke(self, x_top, y_top, w, h, gray=0.5, width=0.8):
+        x = _MARGIN + x_top
+        y = PAGE_H - y_top - h
+        self._ops.append(f"{gray} G {width} w {x:.1f} {y:.1f} {w:.1f} {h:.1f} re S 0 G")
+
     def draw_logo(self, x_top, y_top, w, h):
         if self._logo_raw is None:
             return
         x = _MARGIN + x_top
         y = PAGE_H - y_top - h
         self._ops.append(f"q {w:.1f} 0 0 {h:.1f} {x:.1f} {y:.1f} cm /ImLogo Do Q")
+
+    def draw_govt(self, x_top, y_top, w, h):
+        if self._govt_raw is None:
+            return
+        x = _MARGIN + x_top
+        y = PAGE_H - y_top - h
+        self._ops.append(f"q {w:.1f} 0 0 {h:.1f} {x:.1f} {y:.1f} cm /ImGovt Do Q")
 
     def _embed_logo(self, add_obj):
         if self._logo_raw is None:
@@ -1396,6 +1564,22 @@ class _PdfDoc:
             )
             _id = add_obj(obj)
             self._logo_obj_id = _id
+            return _id
+        except Exception:
+            return None
+
+    def _embed_govt(self, add_obj):
+        if self._govt_raw is None:
+            return None
+        try:
+            data = self._govt_raw
+            obj = (
+                f"<< /Type /XObject /Subtype /Image /Width {self._govt_w} /Height {self._govt_h} "
+                f"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode "
+                f"/Length {len(data)} >>\nstream\n".encode() + data + b"\nendstream"
+            )
+            _id = add_obj(obj)
+            self._govt_obj_id = _id
             return _id
         except Exception:
             return None
@@ -1442,11 +1626,20 @@ class _PdfDoc:
         logo_id = None
         if self._logo_raw is not None:
             logo_id = self._embed_logo(add_obj)
+        govt_id = None
+        if self._govt_raw is not None:
+            govt_id = self._embed_govt(add_obj)
         page_ids = []
         for ops in self.pages:
             stream = ("\n".join(ops)).encode("cp1252", "replace")
             content_id = add_obj(f"<< /Length {len(stream)} >>\nstream\n".encode() + stream + b"\nendstream")
-            xobj_part = f" /XObject << /ImLogo {logo_id} 0 R >>" if logo_id else ""
+            xobj_part = ""
+            if logo_id:
+                xobj_part += f" /ImLogo {logo_id} 0 R"
+            if govt_id:
+                xobj_part += f" /ImGovt {govt_id} 0 R"
+            if xobj_part:
+                xobj_part = f" /XObject <<{xobj_part} >>"
             page_ids.append(add_obj(
                 f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W} {PAGE_H}] "
                 f"/Resources << /Font << /F1 {f1} 0 R /F2 {f2} 0 R >>{xobj_part} >> "
@@ -1517,21 +1710,38 @@ class _PdfReport:
             return total_advance * size / tf.units_per_em
         return len(str(s)) * size * 0.52
 
+    def _centered(self, y_top, size, s, bold=False, gray=0):
+        w = self._measure(s, size)
+        x = max(0.0, (PAGE_W - 2 * _MARGIN - w) / 2.0)
+        self.doc.text(x, y_top, size, s, bold=bold, gray=gray)
+
     def _draw_header(self):
-        # logo + org name at very top - preserve aspect ratio, better fit (larger logo, PNG only)
+        # Bordered header: both logos flank the centered org title.
+        content_w = PAGE_W - 2 * _MARGIN
+        title_w = self._measure(ORG_NAME, 9)
+        lw = lh = gw = gh = 0
         if self.doc._logo_raw is not None and self.doc._logo_h:
-            h = 50
-            w = h * self.doc._logo_w / self.doc._logo_h
+            lh = 44
+            lw = lh * self.doc._logo_w / self.doc._logo_h
             # ensure not too wide
-            if w > 58:
-                w = 58
-                h = w * self.doc._logo_h / self.doc._logo_w
-            self.doc.draw_logo(0, 2, w, h)
-            self.doc.text(w + 8, 15, 9, ORG_NAME, bold=True, gray=0.15)
-            self.doc.text(w + 8, 24, 7.5, ORG_SUBTITLE, gray=0.45)
-        else:
-            self.doc.text(0, 14, 9, ORG_NAME, bold=True, gray=0.15)
-            self.doc.text(0, 24, 7.5, ORG_SUBTITLE, gray=0.45)
+            if lw > 54:
+                lw = 54
+                lh = lw * self.doc._logo_h / self.doc._logo_w
+        if self.doc._govt_raw is not None and self.doc._govt_h:
+            gh = 44
+            gw = gh * self.doc._govt_w / self.doc._govt_h
+        if lw and gw and title_w + lw + gw + 24 <= content_w:
+            cx = (content_w - title_w) / 2.0
+            left_x, govt_x = cx - 50 - lw, cx + title_w + 50
+        else:  # fall back to both ends
+            left_x, govt_x = 0, content_w - gw
+        if lw:
+            self.doc.draw_logo(left_x, 5, lw, lh)
+        if gw:
+            self.doc.draw_govt(govt_x, 5, gw, gh)
+        self._centered(28, 12, ORG_NAME, bold=True, gray=0.15)
+        self._centered(37, 8, ORG_SUBTITLE, gray=0.45)
+        #self.doc.rect_stroke(0, 0, content_w, 48, gray=0.55)
 
     def _draw_footer(self):
         self.doc.line(0, PAGE_H - 22, PAGE_W - 2 * _MARGIN, PAGE_H - 22, gray=0.75)
@@ -1542,16 +1752,16 @@ class _PdfReport:
         self.page_no += 1
         self._draw_header()
         if first:
-            self.doc.text(0, 62, 11, f"Employee Visit Report - Year {self.rep['year']}", bold=True)
+            self._centered(56, 12, f"Employee Visit Report - Year {self.rep['year']}", bold=True)
             meta = (f"Generated: {_fmt_generated(self.rep['generated'])}    Total employees: {self.rep['total_employees']}    "
                     f"Reached yearly limit: {self.rep['blocked_count']}")
-            self.doc.text(0, 72, 8, meta, gray=0.35)
-            self.doc.line(0, 80, PAGE_W - 2 * _MARGIN, 82)
-            self.y = 96
+            self._centered(66, 8, meta, gray=0.35)
+            self.doc.line(0, 70, PAGE_W - 2 * _MARGIN, 70)
+            self.y = 80
         else:
-            self.doc.text(0, 60, 9, f"Employee Visit Report - Year {self.rep['year']} (continued)", bold=True)
-            self.doc.line(0, 66, PAGE_W - 2 * _MARGIN, 66)
-            self.y = 78
+            self._centered(56, 9, f"Employee Visit Report - Year {self.rep['year']} (continued)", bold=True)
+            self.doc.line(0, 60, PAGE_W - 2 * _MARGIN, 60)
+            self.y = 66
         self._draw_footer()
 
     def _ensure(self, needed):
@@ -1560,16 +1770,16 @@ class _PdfReport:
 
     def _section_title(self, title):
         self._ensure(30)
-        self.doc.text(0, self.y + 10, 10.5, title, bold=True)
-        self.y += 18
+        self.doc.text(0, self.y + 8, 10.5, title, bold=True)
+        self.y += 15
 
     def _table_header(self, cols):
-        h = self.LEAD + 8
+        h = self.LEAD + 6
         widths = [w for _, w in cols]
         self.doc.rect_fill(0, self.y, sum(widths), h, gray=0.88)
         x = 0
         for (label, w) in cols:
-            self.doc.text(x + 4, self.y + 14, self.HEAD, label, bold=True)
+            self.doc.text(x + 4, self.y + 12, self.HEAD, label, bold=True)
             x += w
         self.y += h
         self.doc.line(0, self.y, sum(widths), self.y, gray=0.5)
@@ -1578,7 +1788,7 @@ class _PdfReport:
         size = self.BODY
         wraps = [_wrap_pdf(c, w - 8, self._measure, size) for c, (_, w) in zip(cells, cols)]
         lines = max(len(wl) for wl in wraps)
-        rh = lines * self.LEAD + 8
+        rh = lines * self.LEAD + 6
         self._ensure(rh + 6)
         total_w = sum(w for _, w in cols)
         if shade:
@@ -1606,14 +1816,14 @@ class _PdfReport:
                    s["limit_txt"], s["used"], s["remaining"], s["status"], s["reached"]]
             bold = s["status"].startswith("MAX REACHED")
             self._draw_row(self.COLS_ABROAD_SUMMARY, [str(c) for c in row], bold=bold)
-        self.y += 14
+        self.y += 10
         self._section_title("YEARLY LOCAL STATISTICS (no limit)")
         self._table_header(self.COLS_LOCAL_SUMMARY)
         for s in self.rep["local_stats"]:
             row = [s["emp_id"], s["name"], s["designation"], s["emp_type"], s["project"],
                    s["local"]]
             self._draw_row(self.COLS_LOCAL_SUMMARY, [str(c) for c in row])
-        self.y += 14
+        self.y += 10
         self._section_title("VISIT DETAILS")
         for d in self.rep["details"]:
             group = f'{d["name"]} ({d["emp_id"]}) - {d["designation"]}'
@@ -1622,8 +1832,8 @@ class _PdfReport:
             if not d["visits"]:
                 group += f'  (no visits recorded in {self.rep["year"]})'
             self._ensure(40)
-            self.doc.text(0, self.y + 10, 9, group, bold=True)
-            self.y += 17
+            self.doc.text(0, self.y + 8, 9, group, bold=True)
+            self.y += 15
             self._table_header_detail()
             for v in d["visits"]:
                 self._draw_row(self.COLS_DETAIL, [
@@ -1635,7 +1845,7 @@ class _PdfReport:
                     v.get("title", ""),
                     v.get("detail", ""),
                 ])
-            self.y += 10
+            self.y += 8
 
     def _table_header_detail(self):
         self._table_header(self.COLS_DETAIL)
@@ -1692,19 +1902,37 @@ class _TenurePdfReport:
             return total_advance * size / tf.units_per_em
         return len(str(s)) * size * 0.52
 
+    def _centered(self, y_top, size, s, bold=False, gray=0):
+        w = self._measure(s, size)
+        x = max(0.0, (PAGE_W - 2 * _MARGIN - w) / 2.0)
+        self.doc.text(x, y_top, size, s, bold=bold, gray=gray)
+
     def _draw_header(self):
+        # Bordered header: both logos flank the centered org title.
+        content_w = PAGE_W - 2 * _MARGIN
+        title_w = self._measure(ORG_NAME, 9)
+        lw = lh = gw = gh = 0
         if self.doc._logo_raw is not None and self.doc._logo_h:
-            h = 42
-            w = h * self.doc._logo_w / self.doc._logo_h
-            if w > 50:
-                w = 50
-                h = w * self.doc._logo_h / self.doc._logo_w
-            self.doc.draw_logo(0, 3, w, h)
-            self.doc.text(w + 8, 14, 9, ORG_NAME, bold=True, gray=0.15)
-            self.doc.text(w + 8, 24, 7.5, ORG_SUBTITLE, gray=0.45)
-        else:
-            self.doc.text(0, 14, 9, ORG_NAME, bold=True, gray=0.15)
-            self.doc.text(0, 24, 7.5, ORG_SUBTITLE, gray=0.45)
+            lh = 44
+            lw = lh * self.doc._logo_w / self.doc._logo_h
+            if lw > 54:
+                lw = 54
+                lh = lw * self.doc._logo_h / self.doc._logo_w
+        if self.doc._govt_raw is not None and self.doc._govt_h:
+            gh = 44
+            gw = gh * self.doc._govt_w / self.doc._govt_h
+        if lw and gw and title_w + lw + gw + 24 <= content_w:
+            cx = (content_w - title_w) / 2.0
+            left_x, govt_x = cx - 50 - lw, cx + title_w + 50
+        else:  # fall back to both ends
+            left_x, govt_x = 0, content_w - gw
+        if lw:
+            self.doc.draw_logo(left_x, 5, lw, lh)
+        if gw:
+            self.doc.draw_govt(govt_x, 5, gw, gh)
+        self._centered(28, 12, ORG_NAME, bold=True, gray=0.15)
+        self._centered(37, 8, ORG_SUBTITLE, gray=0.45)
+        #self.doc.rect_stroke(0, 0, content_w, 48, gray=0.55)
 
     def _draw_footer(self):
         self.doc.line(0, PAGE_H - 22, PAGE_W - 2 * _MARGIN, PAGE_H - 22, gray=0.75)
@@ -1715,16 +1943,16 @@ class _TenurePdfReport:
         self.page_no += 1
         self._draw_header()
         if first:
-            self.doc.text(0, 62, 13, f"Tenure Report - As of {_fmt_date(self.rep['today'])}", bold=True)
+            self._centered(56, 12, f"Tenure Report - As of {_fmt_date(self.rep['today'])}", bold=True)
             meta = (f"Generated: {_fmt_generated(self.rep['generated'])}    Total employees: {self.rep['total_employees']}    "
                     f"Active: {self.rep['active_count']}    Released: {self.rep['released_count']}")
-            self.doc.text(0, 72, 8, meta, gray=0.35)
-            self.doc.line(0, 80, PAGE_W - 2 * _MARGIN, 82)
-            self.y = 96
+            self._centered(66, 8, meta, gray=0.35)
+            self.doc.line(0, 70, PAGE_W - 2 * _MARGIN, 70)
+            self.y = 80
         else:
-            self.doc.text(0, 60, 9, f"Tenure Report - As of {_fmt_date(self.rep['today'])} (continued)", bold=True)
-            self.doc.line(0, 66, PAGE_W - 2 * _MARGIN, 66)
-            self.y = 78
+            self._centered(56, 9, f"Tenure Report - As of {_fmt_date(self.rep['today'])} (continued)", bold=True)
+            self.doc.line(0, 60, PAGE_W - 2 * _MARGIN, 60)
+            self.y = 66
         self._draw_footer()
 
     def _ensure(self, needed):
@@ -1733,8 +1961,8 @@ class _TenurePdfReport:
 
     def _section_title(self, title):
         self._ensure(30)
-        self.doc.text(0, self.y + 10, 10.5, title, bold=True)
-        self.y += 18
+        self.doc.text(0, self.y + 8, 10.5, title, bold=True)
+        self.y += 15
 
     def _table_header(self, cols):
         h = self.LEAD + 7
@@ -1782,13 +2010,13 @@ class _TenurePdfReport:
                    "Active" if s["is_currently_active"] else "Released"]
             bold = s["is_currently_active"]
             self._draw_row(self.COLS_SUMMARY, row, bold=bold)
-        self.y += 12
+        self.y += 10
         self._section_title("TENURE DETAILS (intervals)")
         for d in self.rep["details"]:
             group = f'{d["name"]} ({d["emp_id"]}) - {d["designation"]}   Total: {d["total_formatted"]} ({d["total_days"]} days)  Status: {d["status"]}'
             self._ensure(30)
-            self.doc.text(0, self.y + 9, 8.5, group, bold=True)
-            self.y += 16
+            self.doc.text(0, self.y + 8, 8.5, group, bold=True)
+            self.y += 14
             self._table_header(self.COLS_DETAIL)
             if not d["intervals"]:
                 self._draw_row(self.COLS_DETAIL, ["(no tenure recorded)", "", "", "", "", "", "", "", ""])
