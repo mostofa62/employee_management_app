@@ -6,7 +6,7 @@ import secrets
 import sqlite3
 import threading
 from contextlib import closing
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 DB_PATH = Path(
@@ -40,16 +40,46 @@ CREATE TABLE IF NOT EXISTS employees (
     project_id      INTEGER REFERENCES projects (id)
 );
 
+CREATE TABLE IF NOT EXISTS visit_purposes (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+);
+
 CREATE TABLE IF NOT EXISTS visits (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     emp_id         TEXT NOT NULL REFERENCES employees (emp_id) ON DELETE CASCADE,
-    country        TEXT NOT NULL,
+    visit_type     TEXT NOT NULL DEFAULT 'Abroad'
+                   CHECK (visit_type IN ('Abroad', 'Local')),
+    country        TEXT NOT NULL DEFAULT '',
+    location       TEXT NOT NULL DEFAULT '',
+    purpose_id     INTEGER REFERENCES visit_purposes (id) ON DELETE SET NULL,
     purpose_title  TEXT NOT NULL,
     purpose_detail TEXT NOT NULL DEFAULT '',
-    visit_date     TEXT NOT NULL
+    visit_date     TEXT NOT NULL,
+    start_date     TEXT NOT NULL DEFAULT '',
+    end_date       TEXT NOT NULL DEFAULT '',
+    start_time     TEXT NOT NULL DEFAULT '',
+    end_time       TEXT NOT NULL DEFAULT '',
+    is_full_day    INTEGER NOT NULL DEFAULT 0,
+    time_mode      TEXT NOT NULL DEFAULT 'fixed'
+                   CHECK (time_mode IN ('fixed', 'per_day'))
+);
+
+CREATE TABLE IF NOT EXISTS visit_days (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    visit_id    INTEGER NOT NULL REFERENCES visits (id) ON DELETE CASCADE,
+    day_date    TEXT NOT NULL,
+    start_time  TEXT NOT NULL DEFAULT '',
+    end_time    TEXT NOT NULL DEFAULT '',
+    is_full_day INTEGER NOT NULL DEFAULT 0,
+    note        TEXT NOT NULL DEFAULT '',
+    UNIQUE (visit_id, day_date)
 );
 
 CREATE INDEX IF NOT EXISTS idx_visits_emp_date ON visits (emp_id, visit_date);
+CREATE INDEX IF NOT EXISTS idx_visit_days_visit ON visit_days (visit_id, day_date);
+-- NOTE: idx_visits_emp_start is created in _migrate() after columns exist
+-- (creating it here would fail on pre-existing old DBs without start_date).
 
 CREATE TABLE IF NOT EXISTS employee_tenures (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,7 +218,79 @@ def _migrate(conn):
             retry_count INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_sync_log_synced ON sync_log (synced, created_at);
+        CREATE TABLE IF NOT EXISTS visit_purposes (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE
+        );
     """)
+    # ── Visits: new concept (Abroad/Local, date range, time slot) ──
+    try:
+        vcols = {r[1] for r in conn.execute("PRAGMA table_info(visits)")}
+        def _add_vcol(ddl):
+            conn.execute(f"ALTER TABLE visits ADD COLUMN {ddl}")
+        if "visit_type" not in vcols:
+            _add_vcol("visit_type TEXT NOT NULL DEFAULT 'Abroad'")
+        if "location" not in vcols:
+            _add_vcol("location TEXT NOT NULL DEFAULT ''")
+        if "purpose_id" not in vcols:
+            _add_vcol("purpose_id INTEGER REFERENCES visit_purposes (id) ON DELETE SET NULL")
+        if "start_date" not in vcols:
+            _add_vcol("start_date TEXT NOT NULL DEFAULT ''")
+        if "end_date" not in vcols:
+            _add_vcol("end_date TEXT NOT NULL DEFAULT ''")
+        if "start_time" not in vcols:
+            _add_vcol("start_time TEXT NOT NULL DEFAULT ''")
+        if "end_time" not in vcols:
+            _add_vcol("end_time TEXT NOT NULL DEFAULT ''")
+        if "is_full_day" not in vcols:
+            _add_vcol("is_full_day INTEGER NOT NULL DEFAULT 0")
+        if "time_mode" not in vcols:
+            _add_vcol("time_mode TEXT NOT NULL DEFAULT 'fixed'")
+        try:
+            conn.execute("UPDATE visits SET time_mode='fixed' WHERE time_mode IS NULL OR time_mode=''")
+        except Exception:
+            pass
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS visit_days (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                visit_id    INTEGER NOT NULL REFERENCES visits (id) ON DELETE CASCADE,
+                day_date    TEXT NOT NULL,
+                start_time  TEXT NOT NULL DEFAULT '',
+                end_time    TEXT NOT NULL DEFAULT '',
+                is_full_day INTEGER NOT NULL DEFAULT 0,
+                note        TEXT NOT NULL DEFAULT '',
+                UNIQUE (visit_id, day_date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_visit_days_visit ON visit_days (visit_id, day_date);
+        """)
+        # Backfill: old rows only had visit_date -> single-day Abroad visit
+        try:
+            conn.execute(
+                "UPDATE visits SET visit_type='Abroad' WHERE visit_type IS NULL OR visit_type=''"
+            )
+        except Exception:
+            pass
+        try:
+            conn.execute("UPDATE visits SET start_date=visit_date WHERE start_date IS NULL OR start_date=''")
+        except Exception:
+            pass
+        try:
+            conn.execute("UPDATE visits SET end_date=visit_date WHERE end_date IS NULL OR end_date=''")
+        except Exception:
+            pass
+        # Seed default purposes (Tour, Workshop, Training, Program, Regular)
+        for _p in ("Tour", "Workshop", "Training", "Program", "Regular"):
+            try:
+                conn.execute("INSERT OR IGNORE INTO visit_purposes (name) VALUES (?)", (_p,))
+            except Exception:
+                pass
+        # Index on new column only after it exists (old DBs would fail otherwise)
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_visits_emp_start ON visits (emp_id, start_date)")
+        except Exception:
+            pass
+    except Exception:
+        pass
     # ensure app_users columns for old installs
     try:
         ucols = {r[1] for r in conn.execute("PRAGMA table_info(app_users)")}
@@ -443,25 +545,170 @@ def normalize_date(value):
         raise ValueError("Date of visit must be in YYYY-MM-DD format.")
 
 
-def yearly_usage(emp_id, year):
+def normalize_time(value, field_name="Time", allow_empty=True):
+    text = (value or "").strip()
+    if not text:
+        if allow_empty:
+            return ""
+        raise ValueError(f"{field_name} is required (HH:MM, 24-hour).")
+    # accept HH:MM or HH:MM:SS or H:MM
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%H:%M")
+        except ValueError:
+            continue
+    # try single-digit hour like "8:00" is covered by %H:%M already; else fail
+    raise ValueError(f"{field_name} must be in HH:MM 24-hour format (e.g. 08:00, 14:30).")
+
+
+VISIT_TYPES = ("Abroad", "Local")
+DEFAULT_PURPOSES = ("Tour", "Workshop", "Training", "Program", "Regular")
+DEFAULT_DAY_START = "08:00"
+DEFAULT_DAY_END = "17:00"
+
+
+def get_visit_settings():
+    day_start = (get_app_state("visit_day_start") or DEFAULT_DAY_START).strip() or DEFAULT_DAY_START
+    day_end = (get_app_state("visit_day_end") or DEFAULT_DAY_END).strip() or DEFAULT_DAY_END
+    # validate, fallback to defaults if corrupt
+    try:
+        day_start = normalize_time(day_start, "Day start", allow_empty=False)
+    except ValueError:
+        day_start = DEFAULT_DAY_START
+    try:
+        day_end = normalize_time(day_end, "Day end", allow_empty=False)
+    except ValueError:
+        day_end = DEFAULT_DAY_END
+    return {"day_start": day_start, "day_end": day_end}
+
+
+def set_visit_settings(day_start, day_end):
+    day_start = normalize_time(day_start, "Default start time", allow_empty=False)
+    day_end = normalize_time(day_end, "Default end time", allow_empty=False)
+    if day_end <= day_start:
+        raise ValueError("Default end time must be after start time.")
+    set_app_state("visit_day_start", day_start)
+    set_app_state("visit_day_end", day_end)
+    return get_visit_settings()
+
+
+# ── Visit purposes (Tour, Workshop, Training, Program, Regular ...) ──
+
+def ensure_visit_purpose(name, _do_sync=True):
+    text = " ".join((name or "").split())
+    if not text:
+        return None
+    with closing(_connect()) as conn:
+        row = conn.execute("SELECT id FROM visit_purposes WHERE name = ?", (text,)).fetchone()
+        if row:
+            return row["id"]
+    inserted = False
+    with closing(_connect()) as conn, conn:
+        try:
+            cur = conn.execute("INSERT INTO visit_purposes (name) VALUES (?)", (text,))
+            row_id = cur.lastrowid
+            inserted = True
+        except sqlite3.IntegrityError:
+            row = conn.execute("SELECT id FROM visit_purposes WHERE name = ?", (text,)).fetchone()
+            if not row:
+                raise
+            row_id = row["id"]
+            inserted = False
+    if inserted and _do_sync:
+        _log_sync('visit_purposes', row_id, 'INSERT', {'name': text})
+    return row_id
+
+
+def list_visit_purposes():
+    with closing(_connect()) as conn:
+        return conn.execute(
+            """SELECT vp.id, vp.name,
+                      (SELECT COUNT(*) FROM visits v WHERE v.purpose_id = vp.id) AS visits_used
+               FROM visit_purposes vp
+               ORDER BY vp.name COLLATE NOCASE"""
+        ).fetchall()
+
+
+def delete_visit_purpose(purpose_id):
+    with closing(_connect()) as conn, conn:
+        exists = conn.execute("SELECT 1 FROM visit_purposes WHERE id = ?", (purpose_id,)).fetchone()
+        if not exists:
+            raise ValueError("This purpose no longer exists.")
+        conn.execute("UPDATE visits SET purpose_id = NULL WHERE purpose_id = ?", (purpose_id,))
+        conn.execute("DELETE FROM visit_purposes WHERE id = ?", (purpose_id,))
+    _log_sync('visit_purposes', purpose_id, 'DELETE')
+
+
+def rename_visit_purpose(purpose_id, new_name):
+    text = " ".join((new_name or "").split())
+    if not text:
+        raise ValueError("Purpose name cannot be empty.")
+    with closing(_connect()) as conn, conn:
+        exists = conn.execute("SELECT 1 FROM visit_purposes WHERE id = ?", (purpose_id,)).fetchone()
+        if not exists:
+            raise ValueError("This purpose no longer exists.")
+        clash = conn.execute(
+            "SELECT 1 FROM visit_purposes WHERE name = ? AND id <> ?", (text, purpose_id)
+        ).fetchone()
+        if clash:
+            raise ValueError(f'A purpose named "{text}" already exists.')
+        conn.execute("UPDATE visit_purposes SET name = ? WHERE id = ?", (text, purpose_id))
+    _log_sync('visit_purposes', purpose_id, 'UPDATE', {'name': text})
+
+
+def _resolve_purpose_id(purpose):
+    """Accept id (int), name (str), or None -> purpose_id or None."""
+    if purpose is None:
+        return None
+    if isinstance(purpose, int):
+        with closing(_connect()) as conn:
+            row = conn.execute("SELECT id FROM visit_purposes WHERE id = ?", (purpose,)).fetchone()
+            if not row:
+                raise ValueError("Selected purpose does not exist.")
+            return row["id"]
+    text = " ".join(str(purpose).split())
+    if not text:
+        return None
+    return ensure_visit_purpose(text, _do_sync=False)
+
+
+def yearly_usage(emp_id, year, visit_type="Abroad"):
+    """Count visits starting in `year`. Default counts Abroad only (yearly limit scope).
+
+    Pass visit_type=None to count all types (backward-compat reporting).
+    """
     year = str(year)
     with closing(_connect()) as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM visits WHERE emp_id = ? AND substr(visit_date, 1, 4) = ?",
-            (emp_id, year),
-        ).fetchone()
+        # Old rows: start_date mirrors visit_date; use COALESCE for safety
+        if visit_type is None:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM visits WHERE emp_id = ? AND substr(COALESCE(NULLIF(start_date,''),visit_date), 1, 4) = ?",
+                (emp_id, year),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM visits WHERE emp_id = ? AND visit_type = ? AND substr(COALESCE(NULLIF(start_date,''),visit_date), 1, 4) = ?",
+                (emp_id, visit_type, year),
+            ).fetchone()
         return row[0]
 
 
-def _assert_visit_allowed(conn, emp_id, visit_date, exclude_id=None):
+def _assert_visit_allowed(conn, emp_id, start_date, visit_type="Abroad", exclude_id=None):
+    # Yearly limit applies to Abroad visits only; Local visits are unlimited.
+    if (visit_type or "Abroad") != "Abroad":
+        # still verify employee exists
+        emp = conn.execute("SELECT 1 FROM employees WHERE emp_id = ?", (emp_id,)).fetchone()
+        if emp is None:
+            raise ValueError("Please select a valid employee.")
+        return
     emp = conn.execute("SELECT name, max_visits FROM employees WHERE emp_id = ?", (emp_id,)).fetchone()
     if emp is None:
         raise ValueError("Please select a valid employee.")
     limit = emp["max_visits"]
     if limit <= 0:
         return
-    year = visit_date[:4]
-    sql = "SELECT COUNT(*) FROM visits WHERE emp_id = ? AND substr(visit_date, 1, 4) = ?"
+    year = (start_date or "")[:4]
+    sql = "SELECT COUNT(*) FROM visits WHERE emp_id = ? AND visit_type = 'Abroad' AND substr(COALESCE(NULLIF(start_date,''),visit_date), 1, 4) = ?"
     params = [emp_id, year]
     if exclude_id is not None:
         sql += " AND id <> ?"
@@ -476,60 +723,378 @@ def _assert_visit_allowed(conn, emp_id, visit_date, exclude_id=None):
         )
 
 
-def _clean_visit(emp_id, country, purpose_title, purpose_detail, visit_date):
+def _assert_no_overlap(conn, emp_id, start_date, end_date, exclude_id=None):
+    # Helper for UI warnings (not hard-enforced, to keep legacy same-day
+    # duplicates working). Returns overlapping row or None.
+    sql = """SELECT id, COALESCE(NULLIF(start_date,''),visit_date) AS s,
+                    COALESCE(NULLIF(end_date,''),visit_date) AS e
+             FROM visits WHERE emp_id = ?
+               AND COALESCE(NULLIF(start_date,''),visit_date) <= ?
+               AND COALESCE(NULLIF(end_date,''),visit_date) >= ?"""
+    params = [emp_id, end_date, start_date]
+    if exclude_id is not None:
+        sql += " AND id <> ?"
+        params.append(exclude_id)
+    rows = conn.execute(sql, params).fetchall()
+    if rows:
+        r = rows[0]
+        raise ValueError(
+            f"Overlapping visit #{r['id']} ({r['s']} -> {r['e']}). "
+            f"An employee cannot have two overlapping visits."
+        )
+
+
+TIME_MODES = ("fixed", "per_day")
+MAX_VISIT_DAYS = 62
+
+
+def _date_range_list(start_iso, end_iso):
+    s = datetime.strptime(start_iso, "%Y-%m-%d").date()
+    e = datetime.strptime(end_iso, "%Y-%m-%d").date()
+    if (e - s).days + 1 > MAX_VISIT_DAYS:
+        raise ValueError(
+            f"Visit range is too long ({(e - s).days + 1} days). "
+            f"Please split into visits of at most {MAX_VISIT_DAYS} days."
+        )
+    out = []
+    d = s
+    while d <= e:
+        out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
+
+
+def _clean_daily_slots(start_date, end_date, daily_slots, header_start="", header_end="",
+                       header_full_day=False):
+    """Validate per-day time variance rows.
+
+    daily_slots: iterable of dicts {date|day_date, start_time, end_time,
+    is_full_day, note}. Empty times = off day (no program that day).
+    Returns cleaned list sorted by date. Raises ValueError on problems.
+    If daily_slots is None/empty, auto-fills every date from header times.
+    """
+    days = _date_range_list(start_date, end_date)
+    settings = get_visit_settings()
+    cleaned = {}
+    if not daily_slots:
+        # auto-fill from header (fixed-time shortcut for per_day mode)
+        for d in days:
+            if header_full_day:
+                st, et, full = settings["day_start"], settings["day_end"], 1
+            else:
+                st = normalize_time(header_start, f"Start time ({d})", allow_empty=True)
+                et = normalize_time(header_end, f"End time ({d})", allow_empty=True)
+                full = 0
+            if st and et and et <= st:
+                raise ValueError(f"End time must be after start time on {d}.")
+            cleaned[d] = {"day_date": d, "start_time": st, "end_time": et,
+                          "is_full_day": full, "note": ""}
+        return [cleaned[d] for d in days]
+    for i, raw in enumerate(daily_slots):
+        if not isinstance(raw, dict):
+            raise ValueError(f"Day row #{i + 1} is invalid.")
+        d = normalize_date(raw.get("day_date", raw.get("date", "")))
+        if d < start_date or d > end_date:
+            raise ValueError(f"Day {d} is outside the visit range {start_date} -> {end_date}.")
+        if d in cleaned:
+            raise ValueError(f"Duplicate day entry for {d}.")
+        full = raw.get("is_full_day", False)
+        full = bool(int(full) if isinstance(full, str) and full.strip().isdigit() else full)
+        if full:
+            st, et = settings["day_start"], settings["day_end"]
+        else:
+            st = normalize_time(raw.get("start_time", ""), f"Start time ({d})", allow_empty=True)
+            et = normalize_time(raw.get("end_time", ""), f"End time ({d})", allow_empty=True)
+        if st and et and et <= st:
+            raise ValueError(f"End time must be after start time on {d}.")
+        note = (raw.get("note", "") or "").strip()
+        cleaned[d] = {"day_date": d, "start_time": st, "end_time": et,
+                      "is_full_day": 1 if full else 0, "note": note}
+    missing = [d for d in days if d not in cleaned]
+    if missing:
+        raise ValueError(
+            f"Per-day times missing for {len(missing)} day(s): {', '.join(missing[:5])}"
+            f"{' ...' if len(missing) > 5 else ''}. "
+            f"Fill every day or leave its time empty for an off day."
+        )
+    return [cleaned[d] for d in days]
+
+
+def list_visit_days(visit_id):
+    with closing(_connect()) as conn:
+        return conn.execute(
+            "SELECT * FROM visit_days WHERE visit_id = ? ORDER BY day_date",
+            (visit_id,),
+        ).fetchall()
+
+
+def expand_visit_days(visit):
+    """Effective per-day schedule for a visit row/dict.
+
+    fixed mode -> one generated row per date from header times.
+    per_day mode -> stored rows (fallback to generated if missing).
+    """
+    if isinstance(visit, sqlite3.Row):
+        visit = dict(visit)
+    if visit is None:
+        return []
+    s = (visit.get("start_date") or visit.get("visit_date") or "").strip()
+    e = (visit.get("end_date") or s).strip()
+    if not s:
+        return []
+    mode = (visit.get("time_mode") or "fixed").strip() or "fixed"
+    if mode == "per_day" and visit.get("id") is not None:
+        try:
+            rows = [dict(r) for r in list_visit_days(visit["id"])]
+            if rows:
+                return rows
+        except Exception:
+            pass
+    settings = get_visit_settings()
+    if visit.get("is_full_day"):
+        st, et, full = settings["day_start"], settings["day_end"], 1
+    else:
+        st, et, full = visit.get("start_time") or "", visit.get("end_time") or "", 0
+    return [{"day_date": d, "start_time": st, "end_time": et,
+             "is_full_day": full, "note": ""} for d in _date_range_list(s, e)]
+
+
+def visit_time_summary(visit):
+    """Short display string for the time pattern, e.g. 'fixed 09:00-12:00 x3d'
+    or 'per-day (varies)'. Uses stored rows when available."""
+    try:
+        days = expand_visit_days(visit)
+    except Exception:
+        return ""
+    if not days:
+        return ""
+    if isinstance(visit, sqlite3.Row):
+        mode = visit["time_mode"] if "time_mode" in visit.keys() else "fixed"
+    elif isinstance(visit, dict):
+        mode = visit.get("time_mode", "fixed")
+    else:
+        mode = "fixed"
+    if mode == "per_day":
+        slots = {(d["start_time"], d["end_time"]) for d in days if d["start_time"] or d["end_time"]}
+        if len(slots) <= 1:
+            st, et = next(iter(slots)) if slots else ("", "")
+            label = f"{st}-{et}".strip("-") or "no fixed time"
+            return f"per-day (same {label})"
+        return "per-day (varies)"
+    d0 = days[0]
+    if d0["is_full_day"]:
+        return f"fixed full-day {d0['start_time']}-{d0['end_time']}"
+    if d0["start_time"] or d0["end_time"]:
+        return f"fixed {d0['start_time']}-{d0['end_time']}".strip("- ")
+    return "no fixed time"
+
+
+def _clean_visit(emp_id, country, purpose_title, purpose_detail, visit_date,
+                 visit_type="Abroad", purpose=None, location="",
+                 start_date=None, end_date=None,
+                 start_time="", end_time="", is_full_day=False,
+                 time_mode="fixed", daily_slots=None):
     emp_id = (emp_id or "").strip()
     country = (country or "").strip()
+    location = (location or "").strip()
     purpose_title = (purpose_title or "").strip()
     purpose_detail = (purpose_detail or "").strip()
-    visit_date = normalize_date(visit_date)
     if not emp_id:
         raise ValueError("Please select an employee.")
-    if not country:
-        raise ValueError("Country is required.")
+    visit_type = (visit_type or "Abroad").strip().capitalize()
+    if visit_type not in VISIT_TYPES:
+        raise ValueError(f"Visit type must be one of: {', '.join(VISIT_TYPES)}.")
     if not purpose_title:
         raise ValueError("Purpose title is required.")
-    return emp_id, country, purpose_title, purpose_detail, visit_date
+    # Date range: start_date defaults to legacy visit_date; end_date defaults to start
+    base = (start_date or visit_date or "").strip() if isinstance(start_date or visit_date, str) else (start_date or visit_date)
+    start_date = normalize_date(base)
+    if end_date is None or (isinstance(end_date, str) and not end_date.strip()):
+        end_date = start_date  # single-day visit
+    else:
+        end_date = normalize_date(end_date)
+    if end_date < start_date:
+        raise ValueError("End date cannot be before start date.")
+    # Destination validation per type
+    if visit_type == "Abroad":
+        if not country:
+            raise ValueError("Country is required for abroad visits.")
+    else:
+        if not location:
+            raise ValueError("Location / venue is required for local visits.")
+        country = ""  # keep clean: local visits don't use country
+    # Time slots: optional, but validated when present
+    is_full_day = bool(int(is_full_day) if isinstance(is_full_day, str) and is_full_day.strip().isdigit() else is_full_day)
+    if is_full_day:
+        settings = get_visit_settings()
+        start_time = settings["day_start"]
+        end_time = settings["day_end"]
+    else:
+        start_time = normalize_time(start_time, "Start time", allow_empty=True)
+        end_time = normalize_time(end_time, "End time", allow_empty=True)
+    if start_time and end_time and start_date == end_date and end_time <= start_time:
+        raise ValueError("End time must be after start time for a single-day visit.")
+    # Time mode: fixed = one slot for every day (single entry enough);
+    # per_day = each day may vary (stored in visit_days).
+    time_mode = (time_mode or "fixed").strip() or "fixed"
+    if time_mode not in TIME_MODES:
+        raise ValueError(f"Time mode must be one of: {', '.join(TIME_MODES)}.")
+    if time_mode == "per_day" and start_date != end_date:
+        # range cap enforced inside _clean_daily_slots via _date_range_list
+        pass
+    days_cleaned = []
+    if time_mode == "per_day":
+        days_cleaned = _clean_daily_slots(
+            start_date, end_date, daily_slots,
+            header_start=start_time, header_end=end_time,
+            header_full_day=bool(is_full_day),
+        )
+    elif daily_slots:
+        raise ValueError("Day-wise times need 'Different each day' mode. Switch time mode to per_day.")
+    purpose_id = _resolve_purpose_id(purpose)
+    visit_date = start_date  # legacy mirror
+    return {
+        "emp_id": emp_id, "visit_type": visit_type, "country": country,
+        "location": location, "purpose_id": purpose_id,
+        "purpose_title": purpose_title, "purpose_detail": purpose_detail,
+        "visit_date": visit_date, "start_date": start_date, "end_date": end_date,
+        "start_time": start_time, "end_time": end_time,
+        "is_full_day": 1 if is_full_day else 0,
+        "time_mode": time_mode, "daily_slots": days_cleaned,
+    }
 
 
-def add_visit(emp_id, country, purpose_title, purpose_detail, visit_date):
-    emp_id, country, purpose_title, purpose_detail, visit_date = _clean_visit(
-        emp_id, country, purpose_title, purpose_detail, visit_date
-    )
+def _write_visit_days(conn, visit_id, days_cleaned):
+    conn.execute("DELETE FROM visit_days WHERE visit_id = ?", (visit_id,))
+    for d in days_cleaned:
+        conn.execute(
+            """INSERT INTO visit_days (visit_id, day_date, start_time, end_time, is_full_day, note)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (visit_id, d["day_date"], d["start_time"], d["end_time"],
+             d["is_full_day"], d["note"]),
+        )
+
+
+def add_visit(emp_id, country, purpose_title, purpose_detail, visit_date,
+              visit_type="Abroad", purpose=None, location="",
+              start_date=None, end_date=None,
+              start_time="", end_time="", is_full_day=False,
+              time_mode="fixed", daily_slots=None):
+    # Backward compat: old callers may pass visit_date positionally; if they
+    # passed new start/end via visit_date confusion, normalize handles it.
+    # Also allow start_date passed as 5th positional? No - keep signature stable.
+    data = _clean_visit(emp_id, country, purpose_title, purpose_detail, visit_date,
+                        visit_type=visit_type, purpose=purpose, location=location,
+                        start_date=start_date, end_date=end_date,
+                        start_time=start_time, end_time=end_time,
+                        is_full_day=is_full_day,
+                        time_mode=time_mode, daily_slots=daily_slots)
+    # If caller supplied explicit start_date=None, _clean used visit_date; support
+    # caller passing start/end through visit_date/start_date kwargs already handled.
     with closing(_connect()) as conn, conn:
-        _assert_visit_allowed(conn, emp_id, visit_date)
+        _assert_visit_allowed(conn, data["emp_id"], data["start_date"],
+                              visit_type=data["visit_type"])
         cur = conn.execute(
-            """INSERT INTO visits (emp_id, country, purpose_title, purpose_detail, visit_date)
-               VALUES (?, ?, ?, ?, ?)""",
-            (emp_id, country, purpose_title, purpose_detail, visit_date),
+            """INSERT INTO visits (emp_id, visit_type, country, location, purpose_id,
+                                   purpose_title, purpose_detail, visit_date,
+                                   start_date, end_date, start_time, end_time, is_full_day,
+                                   time_mode)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (data["emp_id"], data["visit_type"], data["country"], data["location"],
+             data["purpose_id"], data["purpose_title"], data["purpose_detail"],
+             data["visit_date"], data["start_date"], data["end_date"],
+             data["start_time"], data["end_time"], data["is_full_day"],
+             data["time_mode"]),
         )
         row_id = cur.lastrowid
-    _log_sync('visits', row_id, 'INSERT', {'emp_id': emp_id, 'country': country, 'visit_date': visit_date})
+        if data["time_mode"] == "per_day":
+            _write_visit_days(conn, row_id, data["daily_slots"])
+    _log_sync('visits', row_id, 'INSERT', {'emp_id': data['emp_id'], 'country': data['country'], 'visit_date': data['visit_date']})
     return row_id
 
 
-def update_visit(visit_id, emp_id, country, purpose_title, purpose_detail, visit_date):
-    emp_id, country, purpose_title, purpose_detail, visit_date = _clean_visit(
-        emp_id, country, purpose_title, purpose_detail, visit_date
-    )
+def update_visit(visit_id, emp_id, country, purpose_title, purpose_detail, visit_date,
+                 visit_type="Abroad", purpose=None, location="",
+                 start_date=None, end_date=None,
+                 start_time="", end_time="", is_full_day=False,
+                 time_mode=None, daily_slots=None):
+    # Preserve existing extended fields when caller uses legacy 6-arg form:
+    # if new kwargs are all defaults, fall back to stored row values.
+    _old_mode = "fixed"
+    _old_days = []
+    try:
+        with closing(_connect()) as _c:
+            _old = _c.execute("SELECT * FROM visits WHERE id = ?", (visit_id,)).fetchone()
+            if _old is not None and ("visit_type" in _old.keys()):
+                _old_mode = (_old["time_mode"] if "time_mode" in _old.keys() else "fixed") or "fixed"
+                try:
+                    _old_days = [dict(r) for r in
+                                 _c.execute("SELECT * FROM visit_days WHERE visit_id = ? ORDER BY day_date",
+                                            (visit_id,)).fetchall()]
+                except Exception:
+                    _old_days = []
+    except Exception:
+        _old = None
+    if (visit_type == "Abroad" and purpose is None and not location
+            and start_date is None and end_date is None
+            and not start_time and not end_time and not is_full_day
+            and time_mode is None and daily_slots is None):
+        try:
+            if _old is not None and ("visit_type" in _old.keys()):
+                visit_type = _old["visit_type"] or "Abroad"
+                purpose = _old["purpose_id"]
+                location = _old["location"] or ""
+                start_date = _old["start_date"] or visit_date
+                end_date = _old["end_date"] or start_date
+                start_time = _old["start_time"] or ""
+                end_time = _old["end_time"] or ""
+                is_full_day = _old["is_full_day"] or 0
+                time_mode = _old_mode
+                daily_slots = _old_days or None
+        except Exception:
+            pass
+    if time_mode is None:
+        time_mode = _old_mode
+    if time_mode == "per_day" and daily_slots is None:
+        daily_slots = _old_days or None
+    data = _clean_visit(emp_id, country, purpose_title, purpose_detail, visit_date,
+                        visit_type=visit_type, purpose=purpose, location=location,
+                        start_date=start_date, end_date=end_date,
+                        start_time=start_time, end_time=end_time,
+                        is_full_day=is_full_day,
+                        time_mode=time_mode, daily_slots=daily_slots)
     with closing(_connect()) as conn, conn:
         exists = conn.execute("SELECT 1 FROM visits WHERE id = ?", (visit_id,)).fetchone()
         if not exists:
             raise ValueError("This visit record no longer exists.")
-        _assert_visit_allowed(conn, emp_id, visit_date, exclude_id=visit_id)
+        _assert_visit_allowed(conn, data["emp_id"], data["start_date"],
+                              visit_type=data["visit_type"], exclude_id=visit_id)
         conn.execute(
             """UPDATE visits
-               SET emp_id = ?, country = ?, purpose_title = ?, purpose_detail = ?, visit_date = ?
-                WHERE id = ?""",
-            (emp_id, country, purpose_title, purpose_detail, visit_date, visit_id),
+               SET emp_id = ?, visit_type = ?, country = ?, location = ?, purpose_id = ?,
+                   purpose_title = ?, purpose_detail = ?, visit_date = ?,
+                   start_date = ?, end_date = ?, start_time = ?, end_time = ?, is_full_day = ?,
+                   time_mode = ?
+               WHERE id = ?""",
+            (data["emp_id"], data["visit_type"], data["country"], data["location"],
+             data["purpose_id"], data["purpose_title"], data["purpose_detail"],
+             data["visit_date"], data["start_date"], data["end_date"],
+             data["start_time"], data["end_time"], data["is_full_day"],
+             data["time_mode"], visit_id),
         )
-    _log_sync('visits', visit_id, 'UPDATE', {'emp_id': emp_id, 'country': country, 'visit_date': visit_date})
+        if data["time_mode"] == "per_day":
+            _write_visit_days(conn, visit_id, data["daily_slots"])
+        else:
+            conn.execute("DELETE FROM visit_days WHERE visit_id = ?", (visit_id,))
+    _log_sync('visits', visit_id, 'UPDATE', {'emp_id': data['emp_id'], 'country': data['country'], 'visit_date': data['visit_date']})
 
 
 def get_visit(visit_id):
     with closing(_connect()) as conn:
         return conn.execute(
-            """SELECT v.*, e.name AS emp_name
+            """SELECT v.*, e.name AS emp_name, vp.name AS purpose_name
                FROM visits v JOIN employees e ON e.emp_id = v.emp_id
+               LEFT JOIN visit_purposes vp ON vp.id = v.purpose_id
                WHERE v.id = ?""",
             (visit_id,),
         ).fetchone()
@@ -541,22 +1106,32 @@ def delete_visit(visit_id):
     _log_sync('visits', visit_id, 'DELETE')
 
 
-def list_visits(year=None, emp_id=None):
-    query = """SELECT v.id, v.visit_date, v.emp_id, e.name AS emp_name,
-                      v.country, v.purpose_title, v.purpose_detail,
+def list_visits(year=None, emp_id=None, visit_type=None):
+    query = """SELECT v.id, v.visit_date,
+                      COALESCE(NULLIF(v.start_date,''),v.visit_date) AS start_date,
+                      COALESCE(NULLIF(v.end_date,''),v.visit_date) AS end_date,
+                      v.emp_id, e.name AS emp_name,
+                      v.visit_type, v.country, v.location, v.purpose_id,
+                      vp.name AS purpose_name,
+                      v.purpose_title, v.purpose_detail,
+                      v.start_time, v.end_time, v.is_full_day, v.time_mode,
                       p.name AS project_name
                FROM visits v JOIN employees e ON e.emp_id = v.emp_id
+               LEFT JOIN visit_purposes vp ON vp.id = v.purpose_id
                LEFT JOIN projects p ON p.id = e.project_id"""
     where, params = [], []
     if year and str(year) != "All":
-        where.append("substr(v.visit_date, 1, 4) = ?")
+        where.append("substr(COALESCE(NULLIF(v.start_date,''),v.visit_date), 1, 4) = ?")
         params.append(str(year))
     if emp_id:
         where.append("v.emp_id = ?")
         params.append(emp_id)
+    if visit_type and visit_type != "All":
+        where.append("v.visit_type = ?")
+        params.append(visit_type)
     if where:
         query += " WHERE " + " AND ".join(where)
-    query += " ORDER BY v.visit_date DESC, v.id DESC"
+    query += " ORDER BY COALESCE(NULLIF(v.start_date,''),v.visit_date) DESC, v.id DESC"
     with closing(_connect()) as conn:
         return conn.execute(query, params).fetchall()
 
@@ -564,9 +1139,9 @@ def list_visits(year=None, emp_id=None):
 def years_present():
     with closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT DISTINCT substr(visit_date, 1, 4) AS y FROM visits ORDER BY y DESC"
+            "SELECT DISTINCT substr(COALESCE(NULLIF(start_date,''),visit_date), 1, 4) AS y FROM visits ORDER BY y DESC"
         ).fetchall()
-        return [r["y"] for r in rows]
+        return [r["y"] for r in rows if r["y"]]
 
 
 def summary(year):
@@ -576,18 +1151,21 @@ def summary(year):
             """SELECT e.emp_id, e.name, e.designation, e.max_visits,
                       e.emp_type, p.name AS project_name,
                       (SELECT COUNT(*) FROM visits v
-                        WHERE v.emp_id = e.emp_id
-                          AND substr(v.visit_date, 1, 4) = ?) AS used_this_year,
+                        WHERE v.emp_id = e.emp_id AND v.visit_type = 'Abroad'
+                          AND substr(COALESCE(NULLIF(v.start_date,''),v.visit_date), 1, 4) = ?) AS used_this_year,
+                      (SELECT COUNT(*) FROM visits v
+                        WHERE v.emp_id = e.emp_id AND v.visit_type = 'Local'
+                          AND substr(COALESCE(NULLIF(v.start_date,''),v.visit_date), 1, 4) = ?) AS local_this_year,
                       (SELECT COUNT(*) FROM (
-                           SELECT substr(v.visit_date, 1, 4) AS y, COUNT(*) AS c
+                           SELECT substr(COALESCE(NULLIF(v.start_date,''),v.visit_date), 1, 4) AS y, COUNT(*) AS c
                            FROM visits v
-                           WHERE v.emp_id = e.emp_id
-                           GROUP BY substr(v.visit_date, 1, 4))
+                           WHERE v.emp_id = e.emp_id AND v.visit_type = 'Abroad'
+                           GROUP BY substr(COALESCE(NULLIF(v.start_date,''),v.visit_date), 1, 4))
                        WHERE e.max_visits > 0 AND c >= e.max_visits) AS times_max_reached
                FROM employees e
                LEFT JOIN projects p ON p.id = e.project_id
                ORDER BY e.name COLLATE NOCASE""",
-            (year,),
+            (year, year),
         ).fetchall()
 
 

@@ -8,6 +8,7 @@ from PIL import Image, ImageTk
 import db
 import auth
 import reporting
+from reporting import _fmt_datetime, _fmt_date, _fmt_period, _fmt_slot
 from countries import COUNTRIES
 try:
     import turso_sync  # type: ignore
@@ -388,36 +389,320 @@ class VisitForm(ttk.Frame):
         self.on_change = None
 
         self.var_emp = tk.StringVar()
+        self.var_type = tk.StringVar(value="Abroad")
         self.var_country = tk.StringVar()
+        self.var_location = tk.StringVar()
+        self.var_purpose = tk.StringVar()
         self.var_title = tk.StringVar()
-        self.var_date = tk.StringVar(value=datetime.date.today().isoformat())
+        self.var_start = tk.StringVar(value=datetime.date.today().isoformat())
+        self.var_end = tk.StringVar(value=datetime.date.today().isoformat())
+        self.var_start_time = tk.StringVar()
+        self.var_end_time = tk.StringVar()
+        self.var_full_day = tk.BooleanVar(value=False)
+        self.var_time_mode = tk.StringVar(value="fixed")
+        self.day_rows = {}  # date -> {start_var, end_var, full_var, note_var}
 
         ttk.Label(self, text="Employee *").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
         self.cmb_emp = ttk.Combobox(self, textvariable=self.var_emp, state="readonly", width=44)
         self.cmb_emp.grid(row=0, column=1, sticky="we", pady=4)
 
-        ttk.Label(self, text="Country *").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
-        self.cmb_country = ttk.Combobox(self, textvariable=self.var_country, state="readonly", width=44, values=COUNTRIES)
-        self.cmb_country.grid(row=1, column=1, sticky="we", pady=4)
+        ttk.Label(self, text="Visit type *").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.cmb_type = ttk.Combobox(self, textvariable=self.var_type, state="readonly", width=44,
+                                     values=list(db.VISIT_TYPES))
+        self.cmb_type.grid(row=1, column=1, sticky="we", pady=4)
+        self.cmb_type.bind("<<ComboboxSelected>>", lambda e: (self._toggle_destination(), self._changed()))
 
-        ttk.Label(self, text="Purpose title *").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
-        ttk.Entry(self, textvariable=self.var_title, width=46).grid(row=2, column=1, sticky="we", pady=4)
+        # Destination row: country (abroad) / location (local) - toggled
+        self.lbl_dest = ttk.Label(self, text="Country *")
+        self.lbl_dest.grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.dest_wrap = ttk.Frame(self)
+        self.dest_wrap.grid(row=2, column=1, sticky="we", pady=4)
+        self.cmb_country = ttk.Combobox(self.dest_wrap, textvariable=self.var_country, width=42, values=COUNTRIES)
+        self.cmb_country.pack(fill="x")
+        self.ent_location = ttk.Entry(self.dest_wrap, textvariable=self.var_location, width=44)
+        # packed on demand by _toggle_destination
 
-        ttk.Label(self, text="Purpose details").grid(row=3, column=0, sticky="nw", padx=(0, 10), pady=4)
-        self.txt_detail = tk.Text(self, width=48, height=5, wrap="word", relief="solid", bd=1)
-        self.txt_detail.grid(row=3, column=1, sticky="we", pady=4)
+        ttk.Label(self, text="Purpose category").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.cmb_purpose = ttk.Combobox(self, textvariable=self.var_purpose, width=44)
+        self.cmb_purpose.grid(row=3, column=1, sticky="we", pady=4)
+        self.refresh_purposes()
 
-        ttk.Label(self, text="Date of visit *").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=4)
-        date_wrap = ttk.Frame(self)
-        date_wrap.grid(row=4, column=1, sticky="w", pady=4)
-        self.ent_date = ttk.Entry(date_wrap, textvariable=self.var_date, width=13)
-        self.ent_date.pack(side="left")
-        _make_date_picker_button(date_wrap, self.var_date, self.ent_date, disable_future=False).pack(side="left", padx=(4, 0))
-        ttk.Label(date_wrap, text=f"  ({DATE_HINT})").pack(side="left", padx=(4, 0))
+        ttk.Label(self, text="Purpose title *").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Entry(self, textvariable=self.var_title, width=46).grid(row=4, column=1, sticky="we", pady=4)
+
+        ttk.Label(self, text="Purpose details").grid(row=5, column=0, sticky="nw", padx=(0, 10), pady=4)
+        self.txt_detail = tk.Text(self, width=48, height=4, wrap="word", relief="solid", bd=1)
+        self.txt_detail.grid(row=5, column=1, sticky="we", pady=4)
+
+        ttk.Label(self, text="From date *").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=4)
+        start_wrap = ttk.Frame(self)
+        start_wrap.grid(row=6, column=1, sticky="w", pady=4)
+        self.ent_start = ttk.Entry(start_wrap, textvariable=self.var_start, width=13)
+        self.ent_start.pack(side="left")
+        _make_date_picker_button(start_wrap, self.var_start, self.ent_start, disable_future=False).pack(side="left", padx=(4, 0))
+        ttk.Label(start_wrap, text="  To:").pack(side="left", padx=(8, 2))
+        self.ent_end = ttk.Entry(start_wrap, textvariable=self.var_end, width=13)
+        self.ent_end.pack(side="left")
+        _make_date_picker_button(start_wrap, self.var_end, self.ent_end, disable_future=False).pack(side="left", padx=(4, 0))
+        ttk.Label(start_wrap, text=f" ({DATE_HINT}, same = single day)").pack(side="left", padx=(4, 0))
+
+        ttk.Label(self, text="Time slot").grid(row=7, column=0, sticky="nw", padx=(0, 10), pady=4)
+        time_col = ttk.Frame(self)
+        time_col.grid(row=7, column=1, sticky="we", pady=4)
+        time_wrap = ttk.Frame(time_col)
+        time_wrap.pack(fill="x")
+        self.ent_tstart = ttk.Entry(time_wrap, textvariable=self.var_start_time, width=7)
+        self.ent_tstart.pack(side="left")
+        ttk.Label(time_wrap, text=" to ").pack(side="left")
+        self.ent_tend = ttk.Entry(time_wrap, textvariable=self.var_end_time, width=7)
+        self.ent_tend.pack(side="left")
+        ttk.Label(time_wrap, text=" (HH:MM)").pack(side="left", padx=(4, 8))
+        self.chk_full = ttk.Checkbutton(time_wrap, text="Whole day", variable=self.var_full_day,
+                                        command=self._toggle_full_day)
+        self.chk_full.pack(side="left")
+        self.lbl_full_hint = ttk.Label(time_col, text="", foreground="#666666")
+        self.lbl_full_hint.pack(fill="x")
+
+        mode_wrap = ttk.Frame(time_col)
+        mode_wrap.pack(fill="x", pady=(6, 0))
+        ttk.Radiobutton(mode_wrap, text="Same time every day (single entry)",
+                        variable=self.var_time_mode, value="fixed",
+                        command=self._toggle_time_mode).pack(side="left")
+        ttk.Radiobutton(mode_wrap, text="Different each day",
+                        variable=self.var_time_mode, value="per_day",
+                        command=self._toggle_time_mode).pack(side="left", padx=(12, 0))
+
+        self.day_box = ttk.LabelFrame(time_col, text="Day-wise times (empty = off day)", padding=4)
+        # packed on demand by _toggle_time_mode
+        day_btns = ttk.Frame(self.day_box)
+        day_btns.pack(fill="x", pady=(0, 4))
+        ttk.Button(day_btns, text="Copy fixed time to all", command=self._copy_fixed_to_days).pack(side="left", padx=(0, 4))
+        ttk.Button(day_btns, text="Whole-day for all", command=self._fill_full_days).pack(side="left", padx=(0, 4))
+        ttk.Button(day_btns, text="Clear all", command=self._clear_days).pack(side="left")
+        self.day_scroll_wrap = ttk.Frame(self.day_box)
+        self.day_scroll_wrap.pack(fill="both", expand=True)
+        self.day_canvas = tk.Canvas(self.day_scroll_wrap, height=132, highlightthickness=0)
+        self.day_scroll = ttk.Scrollbar(self.day_scroll_wrap, orient="vertical", command=self.day_canvas.yview)
+        self.day_inner = ttk.Frame(self.day_canvas)
+        self.day_inner_id = self.day_canvas.create_window((0, 0), window=self.day_inner, anchor="nw")
+        self.day_canvas.configure(yscrollcommand=self.day_scroll.set)
+        self.day_canvas.pack(side="left", fill="both", expand=True)
+        self.day_scroll.pack(side="right", fill="y")
+        self.day_inner.bind("<Configure>", lambda e: self.day_canvas.configure(scrollregion=self.day_canvas.bbox("all")))
+        self.day_canvas.bind("<Configure>", lambda e: self.day_canvas.itemconfig(self.day_inner_id, width=e.width))
 
         self.columnconfigure(1, weight=1)
         self.cmb_emp.bind("<<ComboboxSelected>>", lambda e: self._changed())
-        self.var_date.trace_add("write", lambda *_: self._changed())
+        self.var_start.trace_add("write", lambda *_: self._on_dates_changed())
+        self.var_end.trace_add("write", lambda *_: self._on_dates_changed())
+        self.var_full_day.trace_add("write", lambda *_: self._changed())
+        self._toggle_destination()
+        self._toggle_full_day()
+        self._toggle_time_mode()
+
+    def _toggle_destination(self):
+        for w in (self.cmb_country, self.ent_location):
+            try:
+                w.pack_forget()
+            except Exception:
+                pass
+        if self.var_type.get() == "Local":
+            self.lbl_dest.config(text="Location *")
+            self.ent_location.pack(fill="x")
+        else:
+            self.lbl_dest.config(text="Country *")
+            self.cmb_country.pack(fill="x")
+
+    def _toggle_full_day(self):
+        try:
+            settings = db.get_visit_settings()
+            hint = f"Whole-day default: {settings['day_start']} - {settings['day_end']} (configurable in Visit Settings)."
+        except Exception:
+            hint = ""
+        self.lbl_full_hint.config(text=hint if self.var_full_day.get() else "Leave empty for no fixed time. Whole-day fills default slot.")
+        state = "disabled" if self.var_full_day.get() else "normal"
+        try:
+            self.ent_tstart.configure(state=state)
+            self.ent_tend.configure(state=state)
+        except Exception:
+            pass
+        if self.var_full_day.get():
+            try:
+                s = db.get_visit_settings()
+                self.var_start_time.set(s["day_start"])
+                self.var_end_time.set(s["day_end"])
+            except Exception:
+                pass
+
+    def _on_dates_changed(self):
+        if self.var_time_mode.get() == "per_day":
+            self._rebuild_day_rows()
+        self._changed()
+
+    def _toggle_time_mode(self):
+        if self.var_time_mode.get() == "per_day":
+            try:
+                self.day_box.pack(fill="both", expand=True, pady=(6, 0))
+            except Exception:
+                pass
+            self._rebuild_day_rows()
+        else:
+            try:
+                self.day_box.pack_forget()
+            except Exception:
+                pass
+        self._changed()
+
+    def _date_list(self):
+        try:
+            s = db.normalize_date(self.var_start.get().strip())
+            e = db.normalize_date((self.var_end.get() or "").strip() or s)
+        except ValueError:
+            return []
+        if e < s:
+            return []
+        try:
+            return db._date_range_list(s, e)
+        except ValueError:
+            # too long - show first MAX days with a note
+            try:
+                out, d = [], datetime.date.fromisoformat(s)
+                for _ in range(db.MAX_VISIT_DAYS):
+                    out.append(d.isoformat())
+                    d += datetime.timedelta(days=1)
+                return out
+            except Exception:
+                return []
+
+    def _rebuild_day_rows(self):
+        dates = self._date_list()
+        # preserve edits for overlapping dates
+        old = {}
+        for d, vals in self.day_rows.items():
+            try:
+                old[d] = (vals["start_var"].get(), vals["end_var"].get(),
+                          bool(vals["full_var"].get()), vals["note_var"].get())
+            except Exception:
+                pass
+        for w in self.day_inner.winfo_children():
+            w.destroy()
+        self.day_rows = {}
+        # header
+        for ci, txt in enumerate(["Date", "Start", "End", "Full", "Note (off-day reason)"]):
+            ttk.Label(self.day_inner, text=txt, font=("Segoe UI", 8, "bold"),
+                      foreground="#006633").grid(row=0, column=ci, sticky="w", padx=2)
+        try:
+            settings = db.get_visit_settings()
+        except Exception:
+            settings = {"day_start": "08:00", "day_end": "17:00"}
+        for ri, d in enumerate(dates, start=1):
+            ttk.Label(self.day_inner, text=d, width=12).grid(row=ri, column=0, sticky="w", padx=2, pady=1)
+            sv, ev, fv, nv = tk.StringVar(), tk.StringVar(), tk.BooleanVar(value=False), tk.StringVar()
+            if d in old:
+                os_, oe, of_, on = old[d]
+                sv.set(os_)
+                ev.set(oe)
+                fv.set(of_)
+                nv.set(on)
+            else:
+                # default each new day from the fixed slot
+                if self.var_full_day.get():
+                    sv.set(settings["day_start"])
+                    ev.set(settings["day_end"])
+                    fv.set(True)
+                else:
+                    sv.set(self.var_start_time.get())
+                    ev.set(self.var_end_time.get())
+            se = ttk.Entry(self.day_inner, textvariable=sv, width=7)
+            se.grid(row=ri, column=1, padx=2, pady=1)
+            ee = ttk.Entry(self.day_inner, textvariable=ev, width=7)
+            ee.grid(row=ri, column=2, padx=2, pady=1)
+            cb = ttk.Checkbutton(self.day_inner, variable=fv,
+                                 command=lambda d=d: self._on_day_full(d))
+            cb.grid(row=ri, column=3, padx=2, pady=1)
+            ne = ttk.Entry(self.day_inner, textvariable=nv, width=18)
+            ne.grid(row=ri, column=4, padx=2, pady=1, sticky="we")
+            self.day_rows[d] = {"start_var": sv, "end_var": ev, "full_var": fv,
+                                "note_var": nv, "start_ent": se, "end_ent": ee}
+            self._apply_day_full_state(d)
+        if not dates:
+            ttk.Label(self.day_inner, text="Enter a valid From/To range first.",
+                      foreground="#888").grid(row=1, column=0, columnspan=5, sticky="w", padx=2)
+        try:
+            self.day_canvas.configure(scrollregion=self.day_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _apply_day_full_state(self, d):
+        vals = self.day_rows.get(d)
+        if not vals:
+            return
+        state = "disabled" if vals["full_var"].get() else "normal"
+        try:
+            vals["start_ent"].configure(state=state)
+            vals["end_ent"].configure(state=state)
+        except Exception:
+            pass
+
+    def _on_day_full(self, d):
+        vals = self.day_rows.get(d)
+        if not vals:
+            return
+        if vals["full_var"].get():
+            try:
+                s = db.get_visit_settings()
+                vals["start_var"].set(s["day_start"])
+                vals["end_var"].set(s["day_end"])
+            except Exception:
+                pass
+        self._apply_day_full_state(d)
+        self._changed()
+
+    def _copy_fixed_to_days(self):
+        st, et, full = self.var_start_time.get(), self.var_end_time.get(), self.var_full_day.get()
+        for d, vals in self.day_rows.items():
+            vals["start_var"].set(st)
+            vals["end_var"].set(et)
+            vals["full_var"].set(bool(full))
+            self._apply_day_full_state(d)
+        self._changed()
+
+    def _fill_full_days(self):
+        try:
+            s = db.get_visit_settings()
+        except Exception:
+            return
+        for d, vals in self.day_rows.items():
+            vals["start_var"].set(s["day_start"])
+            vals["end_var"].set(s["day_end"])
+            vals["full_var"].set(True)
+            self._apply_day_full_state(d)
+        self._changed()
+
+    def _clear_days(self):
+        for d, vals in self.day_rows.items():
+            vals["start_var"].set("")
+            vals["end_var"].set("")
+            vals["full_var"].set(False)
+            self._apply_day_full_state(d)
+        self._changed()
+
+    def get_daily_slots(self):
+        if self.var_time_mode.get() != "per_day":
+            return None
+        return [{"day_date": d,
+                 "start_time": v["start_var"].get(),
+                 "end_time": v["end_var"].get(),
+                 "is_full_day": bool(v["full_var"].get()),
+                 "note": v["note_var"].get()}
+                for d, v in sorted(self.day_rows.items())]
+
+    def refresh_purposes(self):
+        try:
+            names = [p["name"] for p in db.list_visit_purposes()]
+        except Exception:
+            names = list(db.DEFAULT_PURPOSES)
+        self.cmb_purpose["values"] = names
 
     def _changed(self):
         if self.on_change:
@@ -435,6 +720,25 @@ class VisitForm(ttk.Frame):
     def selected_employee(self):
         return self.emp_map.get(self.var_emp.get())
 
+    def payload(self, emp_id):
+        return {
+            "emp_id": emp_id,
+            "country": self.var_country.get(),
+            "purpose_title": self.var_title.get(),
+            "purpose_detail": self.txt_detail.get("1.0", "end"),
+            "visit_date": self.var_start.get(),
+            "visit_type": self.var_type.get(),
+            "purpose": self.var_purpose.get().strip() or None,
+            "location": self.var_location.get(),
+            "start_date": self.var_start.get(),
+            "end_date": self.var_end.get().strip() or self.var_start.get(),
+            "start_time": self.var_start_time.get(),
+            "end_time": self.var_end_time.get(),
+            "is_full_day": bool(self.var_full_day.get()),
+            "time_mode": self.var_time_mode.get() or "fixed",
+            "daily_slots": self.get_daily_slots(),
+        }
+
     def set_visit(self, record):
         target = None
         for disp, row in self.emp_map.items():
@@ -443,18 +747,83 @@ class VisitForm(ttk.Frame):
                 break
         if target:
             self.var_emp.set(target)
-        self.var_country.set(record["country"])
+        try:
+            self.var_type.set(record["visit_type"] if record["visit_type"] else "Abroad")
+        except Exception:
+            self.var_type.set("Abroad")
+        self.var_country.set(record["country"] or "")
+        try:
+            self.var_location.set(record["location"] or "")
+        except Exception:
+            pass
+        try:
+            self.var_purpose.set(record["purpose_name"] or "")
+        except Exception:
+            self.var_purpose.set("")
+        self.refresh_purposes()
+        # keep typed new purpose if not in list
+        try:
+            if self.var_purpose.get() and self.var_purpose.get() not in list(self.cmb_purpose["values"]):
+                self.cmb_purpose["values"] = list(self.cmb_purpose["values"]) + [self.var_purpose.get()]
+        except Exception:
+            pass
         self.var_title.set(record["purpose_title"])
         self.txt_detail.delete("1.0", "end")
-        self.txt_detail.insert("1.0", record["purpose_detail"])
-        self.var_date.set(record["visit_date"])
+        self.txt_detail.insert("1.0", record["purpose_detail"] or "")
+        try:
+            s = record["start_date"] or record["visit_date"]
+            e = record["end_date"] or s
+        except Exception:
+            s = record["visit_date"]
+            e = s
+        self.var_start.set(s)
+        self.var_end.set(e)
+        try:
+            self.var_start_time.set(record["start_time"] or "")
+            self.var_end_time.set(record["end_time"] or "")
+            self.var_full_day.set(bool(record["is_full_day"]))
+        except Exception:
+            pass
+        try:
+            mode = record["time_mode"] if "time_mode" in record.keys() else "fixed"
+            self.var_time_mode.set(mode or "fixed")
+        except Exception:
+            self.var_time_mode.set("fixed")
+        self._toggle_destination()
+        self._toggle_full_day()
+        self._toggle_time_mode()
+        # load stored per-day rows when editing a per_day visit
+        if self.var_time_mode.get() == "per_day":
+            try:
+                stored = [dict(r) for r in db.list_visit_days(record["id"])]
+            except Exception:
+                stored = []
+            if stored:
+                by_date = {r["day_date"]: r for r in stored}
+                for d, vals in self.day_rows.items():
+                    if d in by_date:
+                        r = by_date[d]
+                        vals["start_var"].set(r["start_time"] or "")
+                        vals["end_var"].set(r["end_time"] or "")
+                        vals["full_var"].set(bool(r["is_full_day"]))
+                        vals["note_var"].set(r["note"] or "")
+                        self._apply_day_full_state(d)
 
     def clear(self, keep_employee=False):
         keep = self.var_emp.get() if keep_employee else ""
         self.var_country.set("")
+        self.var_location.set("")
         self.var_title.set("")
         self.txt_detail.delete("1.0", "end")
-        self.var_date.set(datetime.date.today().isoformat())
+        today = datetime.date.today().isoformat()
+        self.var_start.set(today)
+        self.var_end.set(today)
+        self.var_start_time.set("")
+        self.var_end_time.set("")
+        self.var_full_day.set(False)
+        self.var_time_mode.set("fixed")
+        self._toggle_full_day()
+        self._toggle_time_mode()
         if keep and keep in self.emp_map:
             self.var_emp.set(keep)
 
@@ -492,14 +861,7 @@ class VisitDialog(tk.Toplevel):
             messagebox.showwarning("No employee", "Please select an employee.", parent=self)
             return
         try:
-            db.update_visit(
-                self.visit_record["id"],
-                emp["emp_id"],
-                self.form.var_country.get(),
-                self.form.var_title.get(),
-                self.form.txt_detail.get("1.0", "end"),
-                self.form.var_date.get(),
-            )
+            db.update_visit(self.visit_record["id"], **self.form.payload(emp["emp_id"]))
         except ValueError as exc:
             title = "Entry blocked" if str(exc).startswith("BLOCKED") else "Cannot update visit"
             messagebox.showerror(title, str(exc), parent=self)
@@ -663,7 +1025,7 @@ class App(tk.Tk):
     def __init__(self, current_user=None):
         super().__init__()
         self.current_user = current_user  # sqlite Row from app_users
-        self.title("Employee Information & Abroad Visit Tracker - IEDCR")
+        self.title("Employee Information & Visit Tracker - IEDCR")
         try:
             self.state("zoomed")
         except tk.TclError:
@@ -820,6 +1182,7 @@ class App(tk.Tk):
         self.tab_new = ttk.Frame(self.nb, padding=12)
         self.tab_visits = ttk.Frame(self.nb, padding=12)
         self.tab_summary = ttk.Frame(self.nb, padding=12)
+        self.tab_visit_settings = ttk.Frame(self.nb, padding=12)
         self.nb.add(self.tab_emp, text=" Employees ")
         self.nb.add(self.tab_projects, text=" Projects ")
         self.nb.add(self.tab_orgs, text=" Collaborator Orgs ")
@@ -827,6 +1190,7 @@ class App(tk.Tk):
         self.nb.add(self.tab_new, text=" New Visit ")
         self.nb.add(self.tab_visits, text=" Visit Records ")
         self.nb.add(self.tab_summary, text=" Yearly Summary ")
+        self.nb.add(self.tab_visit_settings, text=" Visit Settings ")
 
         self._build_employees_tab()
         self._build_projects_tab()
@@ -835,6 +1199,7 @@ class App(tk.Tk):
         self._build_new_visit_tab()
         self._build_visits_tab()
         self._build_summary_tab()
+        self._build_visit_settings_tab()
 
         self.refresh_all()
         self.nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_all())
@@ -880,7 +1245,7 @@ class App(tk.Tk):
         tab.columnconfigure(1, weight=1)
         tab.rowconfigure(0, weight=1)
 
-        left = ttk.LabelFrame(tab, text="Record a new abroad visit", padding=6)
+        left = ttk.LabelFrame(tab, text="Record a new visit (Abroad / Local)", padding=6)
         left.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
 
         self.vform = VisitForm(left)
@@ -890,7 +1255,7 @@ class App(tk.Tk):
         save_wrap = ttk.Frame(left)
         save_wrap.pack(fill="x", pady=(8, 2))
         ttk.Button(save_wrap, text="Save Visit", command=self.save_new_visit).pack(side="right")
-        ttk.Label(save_wrap, text="Entry is blocked automatically when the yearly limit is reached.").pack(side="left")
+        ttk.Label(save_wrap, text="Abroad limit is enforced; Local visits are unlimited.").pack(side="left")
 
         right = ttk.LabelFrame(tab, text="Limit status for the selected employee and year", padding=8)
         right.grid(row=0, column=1, sticky="nsew")
@@ -902,9 +1267,10 @@ class App(tk.Tk):
                   font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
         cols = [
-            ("date", "Date", 90, "center"),
-            ("country", "Country", 130, "w"),
-            ("title", "Purpose Title", 210, "w"),
+            ("date", "Period", 130, "center"),
+            ("type", "Type", 70, "center"),
+            ("dest", "Destination", 130, "w"),
+            ("title", "Purpose Title", 190, "w"),
         ]
         frame, self.tree_usage = _make_tree(right, cols)
         frame.grid(row=1, column=0, sticky="nsew")
@@ -922,21 +1288,29 @@ class App(tk.Tk):
         self.cmb_visits_year.pack(side="left", padx=(4, 12))
         ttk.Label(top, text="Employee:").pack(side="left")
         self.visits_emp_var = tk.StringVar(value="All employees")
-        self.cmb_visits_emp = ttk.Combobox(top, textvariable=self.visits_emp_var, state="readonly", width=38)
+        self.cmb_visits_emp = ttk.Combobox(top, textvariable=self.visits_emp_var, state="readonly", width=28)
         self.cmb_visits_emp.pack(side="left", padx=(4, 12))
+        ttk.Label(top, text="Type:").pack(side="left")
+        self.visits_type_var = tk.StringVar(value="All")
+        self.cmb_visits_type = ttk.Combobox(top, textvariable=self.visits_type_var, state="readonly", width=10,
+                                            values=["All", "Abroad", "Local"])
+        self.cmb_visits_type.pack(side="left", padx=(4, 12))
+        self.cmb_visits_type.bind("<<ComboboxSelected>>", lambda e: self.refresh_visits())
         ttk.Button(top, text="Refresh", command=self.refresh_visits).pack(side="left", padx=3)
         ttk.Button(top, text="Edit Selected", command=self.edit_visit).pack(side="left", padx=3)
         ttk.Button(top, text="Delete Selected", command=self.delete_visit).pack(side="left", padx=3)
 
         cols = [
             ("id", "#", 45, "center"),
-            ("date", "Date", 90, "center"),
+            ("type", "Type", 70, "center"),
+            ("period", "Period", 150, "center"),
+            ("time", "Time", 160, "center"),
             ("emp_id", "Emp ID", 70, "w"),
-            ("emp_name", "Employee", 130, "w"),
-            ("project_name", "Project", 120, "w"),
-            ("country", "Country", 105, "w"),
-            ("purpose_title", "Purpose Title", 160, "w"),
-            ("purpose_detail", "Purpose Details", 210, "w"),
+            ("emp_name", "Employee", 120, "w"),
+            ("dest", "Destination", 120, "w"),
+            ("purpose", "Purpose", 90, "w"),
+            ("purpose_title", "Purpose Title", 150, "w"),
+            ("purpose_detail", "Purpose Details", 180, "w"),
         ]
         frame, self.tree_visits = _make_tree(tab, cols)
         frame.grid(row=1, column=0, sticky="nsew")
@@ -944,7 +1318,8 @@ class App(tk.Tk):
 
     def _build_summary_tab(self):
         tab = self.tab_summary
-        tab.rowconfigure(2, weight=1)
+        tab.rowconfigure(3, weight=3)
+        tab.rowconfigure(5, weight=2)
         tab.columnconfigure(0, weight=1)
 
         top = ttk.Frame(tab)
@@ -960,27 +1335,90 @@ class App(tk.Tk):
         ttk.Label(top, text="Report:").pack(side="left")
         ttk.Button(top, text="Export PDF", command=self.export_report_pdf).pack(side="left", padx=3)
         ttk.Button(top, text="Export Excel", command=self.export_report_excel).pack(side="left", padx=3)
-        ttk.Button(top, text="Export CSV", command=self.export_report_csv).pack(side="left", padx=3)
         ttk.Button(top, text="Print Report", command=self.print_report).pack(side="left", padx=3)
 
         self.summary_totals_var = tk.StringVar(value="")
         ttk.Label(tab, textvariable=self.summary_totals_var, font=("Segoe UI", 10, "bold")).grid(
             row=1, column=0, sticky="w", pady=(0, 6))
 
-        cols = [
+        # Abroad statistics: yearly limit applies here.
+        ttk.Label(tab, text="Abroad statistics (yearly limit applies)",
+                  font=("Segoe UI", 10, "bold")).grid(row=2, column=0, sticky="w", pady=(0, 4))
+        abroad_cols = [
             ("emp_id", "ID", 75, "w"),
             ("name", "Name", 130, "w"),
             ("designation", "Designation", 105, "w"),
             ("emp_type", "Type", 90, "w"),
             ("project_name", "Project", 115, "w"),
-            ("limit", "Yearly Limit", 80, "center"),
-            ("used", f"Visits ({current_year})", 90, "center"),
+            ("limit", "Abroad Limit", 80, "center"),
+            ("used", f"Abroad ({current_year})", 90, "center"),
             ("remaining", "Remaining", 80, "center"),
             ("status", "Status", 150, "w"),
             ("reached", "Times Max Reached", 120, "center"),
         ]
-        frame, self.tree_summary = _make_tree(tab, cols)
-        frame.grid(row=2, column=0, sticky="nsew")
+        frame_a, self.tree_summary_abroad = _make_tree(tab, abroad_cols)
+        frame_a.grid(row=3, column=0, sticky="nsew")
+
+        # Local statistics: no limit, plain counts.
+        ttk.Label(tab, text="Local statistics (no limit)",
+                  font=("Segoe UI", 10, "bold")).grid(row=4, column=0, sticky="w", pady=(8, 4))
+        local_cols = [
+            ("emp_id", "ID", 75, "w"),
+            ("name", "Name", 130, "w"),
+            ("designation", "Designation", 105, "w"),
+            ("emp_type", "Type", 90, "w"),
+            ("project_name", "Project", 115, "w"),
+            ("local", f"Local ({current_year})", 90, "center"),
+        ]
+        frame_l, self.tree_summary_local = _make_tree(tab, local_cols)
+        frame_l.grid(row=5, column=0, sticky="nsew")
+
+    def _build_visit_settings_tab(self):
+        tab = self.tab_visit_settings
+        tab.rowconfigure(0, weight=1)
+        tab.columnconfigure(0, weight=1)
+        tab.columnconfigure(1, weight=1)
+
+        # Left: purposes
+        left = ttk.LabelFrame(tab, text="Purpose categories (Tour, Workshop, Training, Program, Regular ...)", padding=8)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+        top = ttk.Frame(left)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(top, text="Name:").pack(side="left")
+        self.var_new_purpose = tk.StringVar()
+        ent = ttk.Entry(top, textvariable=self.var_new_purpose, width=24)
+        ent.pack(side="left", padx=(4, 8))
+        ent.bind("<Return>", lambda e: self.add_purpose())
+        ttk.Button(top, text="Add", command=self.add_purpose).pack(side="left", padx=3)
+        ttk.Button(top, text="Rename", command=self.rename_purpose).pack(side="left", padx=3)
+        ttk.Button(top, text="Delete", command=self.delete_purpose).pack(side="left", padx=3)
+        pcols = [("pid", "ID", 50, "center"), ("name", "Purpose Name", 220, "w"), ("used", "Visits", 80, "center")]
+        frame_p, self.tree_purposes = _make_tree(left, pcols)
+        frame_p.grid(row=1, column=0, sticky="nsew")
+        self.tree_purposes.bind("<Double-1>", lambda e: self.rename_purpose())
+        ttk.Label(left, text="(Deleting keeps visits but clears their category. New names typed in visit form are auto-created.)",
+                  foreground="#666666", wraplength=380).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        # Right: whole-day defaults (admin configurable)
+        right = ttk.LabelFrame(tab, text="Whole-day default time slot (admin configurable)", padding=8)
+        right.grid(row=0, column=1, sticky="nsew")
+        ttk.Label(right, text="Default start (HH:MM):").grid(row=0, column=0, sticky="w", pady=4)
+        self.var_day_start = tk.StringVar(value="08:00")
+        ttk.Entry(right, textvariable=self.var_day_start, width=10).grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Label(right, text="Default end (HH:MM):").grid(row=1, column=0, sticky="w", pady=4)
+        self.var_day_end = tk.StringVar(value="17:00")
+        ttk.Entry(right, textvariable=self.var_day_end, width=10).grid(row=1, column=1, sticky="w", pady=4)
+        btn_row = ttk.Frame(right)
+        btn_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 4))
+        ttk.Button(btn_row, text="Save Defaults", command=self.save_visit_settings).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_row, text="Reload", command=self.refresh_visit_settings).pack(side="left")
+        self.visit_settings_var = tk.StringVar(value="")
+        ttk.Label(right, textvariable=self.visit_settings_var, foreground="#006633", wraplength=340,
+                  justify="left").grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(right, text="Ticking 'Whole day' in the visit form fills this slot automatically.\nYou can still edit times manually when unticked.",
+                  foreground="#666666", wraplength=340, justify="left").grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     def _build_tenure_tab(self):
         tab = self.tab_tenure
@@ -1010,7 +1448,6 @@ class App(tk.Tk):
         ttk.Label(top, text="Report:").pack(side="left")
         ttk.Button(top, text="Export PDF", command=self.export_tenure_pdf).pack(side="left", padx=3)
         ttk.Button(top, text="Export Excel", command=self.export_tenure_excel).pack(side="left", padx=3)
-        ttk.Button(top, text="Export CSV", command=self.export_tenure_csv).pack(side="left", padx=3)
         ttk.Button(top, text="Print", command=self.print_tenure).pack(side="left", padx=3)
 
         # Tenure details tree (middle)
@@ -1091,6 +1528,107 @@ class App(tk.Tk):
         self.refresh_visits()
         self.refresh_summary_years()
         self.refresh_summary()
+        try:
+            self.refresh_purposes()
+            self.refresh_visit_settings()
+            self.vform.refresh_purposes()
+        except Exception:
+            pass
+
+    # ── Visit purposes + whole-day settings (admin configurable) ──
+    def refresh_purposes(self):
+        rows = db.list_visit_purposes()
+        self.tree_purposes.delete(*self.tree_purposes.get_children())
+        for p in rows:
+            self.tree_purposes.insert("", "end", iid=str(p["id"]), values=(
+                p["id"], p["name"], p["visits_used"],
+            ))
+
+    def add_purpose(self):
+        name = " ".join(self.var_new_purpose.get().split())
+        if not name:
+            messagebox.showinfo("Empty name", "Enter a purpose name first.", parent=self)
+            return
+        existing = {p["name"].lower() for p in db.list_visit_purposes()}
+        pid = db.ensure_visit_purpose(name)
+        self.var_new_purpose.set("")
+        self.refresh_purposes()
+        try:
+            self.vform.refresh_purposes()
+        except Exception:
+            pass
+        if name.lower() in existing:
+            self.set_status(f'Purpose "{name}" already exists - existing entry reused.')
+        else:
+            self.set_status(f'Purpose "{name}" added.')
+        if pid is not None:
+            try:
+                self.tree_purposes.selection_set(str(pid))
+            except Exception:
+                pass
+
+    def rename_purpose(self):
+        sel = self.tree_purposes.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a purpose first.", parent=self)
+            return
+        pid = int(sel[0])
+        row = next((p for p in db.list_visit_purposes() if p["id"] == pid), None)
+        if not row:
+            return
+        new_name = simpledialog.askstring("Rename Purpose", f'New name for "{row["name"]}":', parent=self)
+        if new_name is None:
+            return
+        new_name = " ".join(new_name.split())
+        if not new_name or new_name.lower() == row["name"].lower():
+            return
+        try:
+            db.rename_visit_purpose(pid, new_name)
+        except ValueError as exc:
+            messagebox.showerror("Cannot rename", str(exc), parent=self)
+            return
+        self.set_status(f'Purpose renamed to "{new_name}".')
+        self.refresh_all()
+
+    def delete_purpose(self):
+        sel = self.tree_purposes.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a purpose first.", parent=self)
+            return
+        pid = int(sel[0])
+        row = next((p for p in db.list_visit_purposes() if p["id"] == pid), None)
+        label = row["name"] if row else f"#{pid}"
+        if messagebox.askyesno("Confirm delete",
+                               f'Delete purpose "{label}"?\nVisits using it will keep but lose the category.',
+                               parent=self):
+            db.delete_visit_purpose(pid)
+            self.set_status("Purpose deleted.")
+            self.refresh_all()
+
+    def refresh_visit_settings(self):
+        try:
+            s = db.get_visit_settings()
+            self.var_day_start.set(s["day_start"])
+            self.var_day_end.set(s["day_end"])
+            self.visit_settings_var.set(f'Current default: {s["day_start"]} - {s["day_end"]}')
+        except Exception:
+            pass
+
+    def save_visit_settings(self):
+        if self.current_user is None or self.current_user["role"] != "admin":
+            messagebox.showerror("Access denied", "Only admin can change whole-day defaults.", parent=self)
+            return
+        try:
+            s = db.set_visit_settings(self.var_day_start.get(), self.var_day_end.get())
+        except ValueError as exc:
+            messagebox.showerror("Invalid time", str(exc), parent=self)
+            return
+        self.visit_settings_var.set(f'Saved default: {s["day_start"]} - {s["day_end"]}')
+        self.set_status(f'Whole-day default saved: {s["day_start"]} - {s["day_end"]}.')
+        try:
+            self.vform._toggle_full_day()
+        except Exception:
+            pass
 
     def refresh_employees(self):
         rows = db.get_employees(self.search_var.get())
@@ -1417,12 +1955,37 @@ class App(tk.Tk):
         emp_id = None
         if emp_disp and not emp_disp.startswith("All"):
             emp_id = emp_disp.split(" - ")[0].strip()
-        rows = db.list_visits(year=None if year == "All years" else year, emp_id=emp_id)
+        vtype = self.visits_type_var.get() if hasattr(self, "visits_type_var") else "All"
+        rows = db.list_visits(year=None if year == "All years" else year, emp_id=emp_id,
+                              visit_type=None if vtype == "All" else vtype)
         self.tree_visits.delete(*self.tree_visits.get_children())
         for r in rows:
+            s = r["start_date"] or r["visit_date"]
+            e = r["end_date"] or s
+            period = _fmt_period(s, e)
+            try:
+                mode = r["time_mode"] if "time_mode" in r.keys() else "fixed"
+            except Exception:
+                mode = "fixed"
+            if (mode or "fixed") == "per_day":
+                try:
+                    day_rows = [dict(r) for r in db.list_visit_days(r["id"])]
+                except Exception:
+                    day_rows = []
+                t = "; ".join(
+                    _fmt_slot(d["day_date"], d["start_time"], d["end_time"],
+                              bool(d["is_full_day"]))
+                    for d in day_rows
+                ) if day_rows else "per-day"
+            elif r["start_time"] or r["end_time"] or r["is_full_day"]:
+                t = _fmt_slot(s, r["start_time"], r["end_time"], bool(r["is_full_day"]))
+            else:
+                t = "-"
+            dest = r["country"] if (r["visit_type"] or "Abroad") == "Abroad" else (r["location"] or "-")
             self.tree_visits.insert("", "end", iid=str(r["id"]), values=(
-                r["id"], r["visit_date"], r["emp_id"], r["emp_name"],
-                r["project_name"] or "", r["country"], r["purpose_title"], r["purpose_detail"],
+                r["id"], r["visit_type"] or "Abroad", period, t,
+                r["emp_id"], r["emp_name"], dest,
+                r["purpose_name"] or "", r["purpose_title"], r["purpose_detail"],
             ))
         self.set_status(f"{len(rows)} visit record(s) shown.")
 
@@ -1435,28 +1998,47 @@ class App(tk.Tk):
     def refresh_summary(self):
         year = self.summary_year_var.get() or str(datetime.date.today().year)
         rows = db.summary(year)
-        self.tree_summary.heading("used", text=f"Visits ({year})")
-        self.tree_summary.delete(*self.tree_summary.get_children())
+        try:
+            self.tree_summary_abroad.heading("used", text=f"Abroad ({year})")
+            self.tree_summary_local.heading("local", text=f"Local ({year})")
+        except Exception:
+            pass
+        self.tree_summary_abroad.delete(*self.tree_summary_abroad.get_children())
+        self.tree_summary_local.delete(*self.tree_summary_local.get_children())
         blocked_count = 0
+        abroad_total = 0
+        local_total = 0
         for r in rows:
             limit = r["max_visits"]
             used = r["used_this_year"]
-            if limit == 0:
-                remaining, status = "Unlimited", "Unlimited visits"
-            elif used >= limit:
-                remaining, status = "0", "MAX REACHED - blocked"
-                blocked_count += 1
-            else:
-                remaining, status = str(limit - used), f"{limit - used} visit(s) left"
-            self.tree_summary.insert("", "end", iid=r["emp_id"], values=(
-                r["emp_id"], r["name"], r["designation"],
-                r["emp_type"] or "", r["project_name"] or "",
-                "Unlimited" if limit == 0 else limit,
-                used, remaining, status, r["times_max_reached"],
-            ))
+            local = r["local_this_year"] if "local_this_year" in r.keys() else 0
+            common = (r["emp_id"], r["name"], r["designation"],
+                      r["emp_type"] or "", r["project_name"] or "")
+            # Abroad segment: yearly limit applies.
+            if used > 0:
+                abroad_total += used
+                if limit == 0:
+                    remaining, status = "Unlimited", "Unlimited visits"
+                elif used >= limit:
+                    remaining, status = "0", "MAX REACHED - blocked"
+                    blocked_count += 1
+                else:
+                    remaining, status = str(limit - used), f"{limit - used} visit(s) left"
+                self.tree_summary_abroad.insert("", "end", iid=r["emp_id"], values=(
+                    *common,
+                    "Unlimited" if limit == 0 else limit,
+                    used, remaining, status, r["times_max_reached"],
+                ))
+            # Local segment: no limit, plain counts.
+            if local > 0:
+                local_total += local
+                self.tree_summary_local.insert("", "end", iid=r["emp_id"], values=(
+                    *common, local,
+                ))
         total = len(rows)
         self.summary_totals_var.set(
-            f"{blocked_count} of {total} employee(s) have reached their maximum abroad-visit limit in {year}."
+            f"{blocked_count} of {total} employee(s) reached the abroad-visit limit in {year} "
+            f"(abroad: {abroad_total}, local: {local_total}). Local visits are unlimited."
         )
 
     def update_usage_panel(self):
@@ -1465,32 +2047,37 @@ class App(tk.Tk):
             self.usage_var.set("Select an employee to see their yearly limit status.")
             self.tree_usage.delete(*self.tree_usage.get_children())
             return
-        raw_date = self.vform.var_date.get().strip()
+        raw_date = self.vform.var_start.get().strip()
         try:
             iso = db.normalize_date(raw_date)
         except ValueError:
-            self.usage_var.set("Enter a valid date of visit (YYYY-MM-DD) to check the limit.")
+            self.usage_var.set("Enter a valid From date (YYYY-MM-DD) to check the limit.")
             self.tree_usage.delete(*self.tree_usage.get_children())
             return
         year = iso[:4]
-        used = db.yearly_usage(emp["emp_id"], year)
+        used = db.yearly_usage(emp["emp_id"], year, visit_type="Abroad")
+        local = db.yearly_usage(emp["emp_id"], year, visit_type="Local")
         limit = emp["max_visits"]
         name_disp = f'{emp["name"]} ({emp["emp_id"]})'
         if limit == 0:
             self.usage_var.set(
-                f'{name_disp}: UNLIMITED facility.\nVisits recorded in {year}: {used}\nEntry always allowed.'
+                f'{name_disp}: UNLIMITED abroad facility.\nAbroad in {year}: {used} | Local in {year}: {local}\nEntry always allowed.'
             )
         elif used >= limit:
             self.usage_var.set(
-                f'{name_disp}: MAXIMUM REACHED in {year} ({used}/{limit}).\nFurther entry will be BLOCKED.'
+                f'{name_disp}: MAXIMUM REACHED in {year} ({used}/{limit} abroad, {local} local).\nFurther ABROAD entry will be BLOCKED (local still allowed).'
             )
         else:
             self.usage_var.set(
-                f'{name_disp}: {used} of {limit} visit(s) used in {year}.\n{limit - used} more allowed this year.'
+                f'{name_disp}: {used} of {limit} abroad visit(s) used in {year} (local: {local}).\n{limit - used} more abroad allowed this year.'
             )
         self.tree_usage.delete(*self.tree_usage.get_children())
         for v in db.list_visits(year=year, emp_id=emp["emp_id"]):
-            self.tree_usage.insert("", "end", values=(v["visit_date"], v["country"], v["purpose_title"]))
+            s = v["start_date"] or v["visit_date"]
+            e = v["end_date"] or s
+            period = _fmt_period(s, e)
+            dest = v["country"] if (v["visit_type"] or "Abroad") == "Abroad" else (v["location"] or "-")
+            self.tree_usage.insert("", "end", values=(period, v["visit_type"] or "Abroad", dest, v["purpose_title"]))
 
     def _selected_emp_id(self):
         sel = self.tree_emp.selection()
@@ -1534,21 +2121,18 @@ class App(tk.Tk):
         if not emp:
             messagebox.showwarning("No employee", "Please select an employee first.", parent=self)
             return
-        detail = self.vform.txt_detail.get("1.0", "end")
         try:
-            db.add_visit(
-                emp["emp_id"],
-                self.vform.var_country.get(),
-                self.vform.var_title.get(),
-                detail,
-                self.vform.var_date.get(),
-            )
+            db.add_visit(**self.vform.payload(emp["emp_id"]))
         except ValueError as exc:
             title = "Entry blocked" if str(exc).startswith("BLOCKED") else "Cannot add visit"
             messagebox.showerror(title, str(exc), parent=self)
             self.update_usage_panel()
             return
-        self.set_status(f'Visit saved for {emp["name"]} on {db.normalize_date(self.vform.var_date.get())}.')
+        try:
+            saved_start = db.normalize_date(self.vform.var_start.get())
+        except Exception:
+            saved_start = self.vform.var_start.get()
+        self.set_status(f'Visit saved for {emp["name"]} ({self.vform.var_type.get()}) starting {saved_start}.')
         self.vform.clear(keep_employee=True)
         self.refresh_all()
 
@@ -1599,9 +2183,6 @@ class App(tk.Tk):
                 os.startfile(path)
             except OSError as exc:
                 messagebox.showerror("Cannot open file", str(exc), parent=self)
-
-    def export_report_csv(self):
-        self._save_report(".csv", ("CSV file", "*.csv"), reporting.export_csv)
 
     def export_report_excel(self):
         self._save_report(".xlsx", ("Excel workbook", "*.xlsx"), reporting.export_xlsx)
@@ -1654,9 +2235,6 @@ class App(tk.Tk):
                 os.startfile(path)
             except OSError as exc:
                 messagebox.showerror("Cannot open file", str(exc), parent=self)
-
-    def export_tenure_csv(self):
-        self._save_tenure_report(".csv", ("CSV file", "*.csv"), reporting.export_tenure_csv)
 
     def export_tenure_excel(self):
         self._save_tenure_report(".xlsx", ("Excel workbook", "*.xlsx"), reporting.export_tenure_xlsx)
@@ -1867,6 +2445,10 @@ class App(tk.Tk):
         _run_app_with_auth()
 
     def _on_close(self):
+        if not messagebox.askyesno("Confirm exit",
+                                   "Are you sure you want to close the application?",
+                                   parent=self):
+            return
         try:
             if _HAS_TURSO and turso_sync is not None:
                 try:

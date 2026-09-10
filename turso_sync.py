@@ -510,8 +510,8 @@ def test_connection(cfg: Optional[Dict[str, str]] = None, timeout: float = 8.0) 
 
 # ── Snapshot sync ─────────────────────────────────────────────
 # Order matters for FK
-_TABLES_INSERT_ORDER = ["projects", "organizations", "employees", "app_users", "visits", "employee_tenures", "employee_assignments"]
-_TABLES_DELETE_ORDER = ["employee_assignments", "employee_tenures", "visits", "employees", "organizations", "projects", "app_users"]
+_TABLES_INSERT_ORDER = ["projects", "organizations", "visit_purposes", "employees", "app_users", "visits", "visit_days", "employee_tenures", "employee_assignments"]
+_TABLES_DELETE_ORDER = ["employee_assignments", "employee_tenures", "visit_days", "visits", "employees", "organizations", "projects", "visit_purposes", "app_users"]
 
 def _local_tables(conn: sqlite3.Connection, include_tables: List[str]) -> List[str]:
     cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
