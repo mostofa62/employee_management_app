@@ -853,6 +853,83 @@ class AddUserDialog(tk.Toplevel):
         self.destroy()
 
 
+class EditUserDialog(tk.Toplevel):
+    """Edit an existing user's info (name, mobile, email, role, active flag)."""
+    def __init__(self, master, user_id):
+        super().__init__(master)
+        self.saved = False
+        self.user_id = user_id
+        user = db.get_user_by_id(user_id)
+        if not user:
+            messagebox.showerror("Not found", "This user no longer exists.", parent=master)
+            self.saved = False
+            self.destroy()
+            return
+        self.title(f"Edit User - {user['name']}")
+        self.resizable(False, False)
+        frm = ttk.Frame(self, padding=18)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text=f"Edit User #{user['id']}", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0,8))
+
+        self.var_name = tk.StringVar(value=user["name"] or "")
+        self.var_phone = tk.StringVar(value=user["phone"] or "")
+        self.var_email = tk.StringVar(value=user["email"] or "")
+        self.var_role = tk.StringVar(value=user["role"] or "user")
+        self.var_active = tk.BooleanVar(value=bool(user["is_active"]))
+
+        rows = [
+            ("Full Name *", self.var_name),
+            ("Mobile *", self.var_phone),
+            ("Email *", self.var_email),
+        ]
+        for i, (lbl, var) in enumerate(rows):
+            ttk.Label(frm, text=lbl).grid(row=1+i, column=0, sticky="w", padx=(0,10), pady=4)
+            ttk.Entry(frm, textvariable=var, width=30).grid(row=1+i, column=1, sticky="we", pady=4)
+        ttk.Label(frm, text="Role *").grid(row=4, column=0, sticky="w", padx=(0,10), pady=4)
+        ttk.Combobox(frm, textvariable=self.var_role, state="readonly", width=28, values=["admin","user"]).grid(row=4, column=1, sticky="we", pady=4)
+        ttk.Checkbutton(frm, text="Account active (login allowed)", variable=self.var_active).grid(row=5, column=1, sticky="w", pady=(6,4))
+        ttk.Label(frm, text="Use 'Reset Password' in Manage Users to change the password.",
+                  foreground="#666666", wraplength=360, justify="left").grid(row=6, column=0, columnspan=2, sticky="w", pady=(2,4))
+        btns = ttk.Frame(frm)
+        btns.grid(row=7, column=0, columnspan=2, sticky="e", pady=(10,0))
+        ttk.Button(btns, text="Save", command=self._save).pack(side="left", padx=4)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left")
+        self.bind("<Return>", lambda e: self._save())
+        self.bind("<Escape>", lambda e: self.destroy())
+        try:
+            if master.winfo_viewable():
+                self.transient(master)
+        except Exception:
+            pass
+        self.update_idletasks()
+        self.deiconify()
+        try:
+            if master.winfo_viewable():
+                self.grab_set()
+        except Exception:
+            pass
+        try:
+            self.focus_set()
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            db.update_app_user(
+                self.user_id,
+                self.var_name.get(), self.var_phone.get(), self.var_email.get(),
+                role=self.var_role.get(), is_active=bool(self.var_active.get()),
+            )
+        except ValueError as exc:
+            messagebox.showerror("Invalid input", str(exc), parent=self)
+            return
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc), parent=self)
+            return
+        self.saved = True
+        self.destroy()
+
+
 class ManageUsersDialog(tk.Toplevel):
     def __init__(self, master):
         super().__init__(master)
@@ -865,6 +942,8 @@ class ManageUsersDialog(tk.Toplevel):
         top.pack(fill="x", pady=(0,6))
         ttk.Label(top, text="Users", font=("Segoe UI", 11, "bold")).pack(side="left")
         ttk.Button(top, text="Add User", command=self._add).pack(side="left", padx=8)
+        ttk.Button(top, text="Edit Selected", command=self._edit).pack(side="left", padx=4)
+        ttk.Button(top, text="Enable/Disable", command=self._toggle_active).pack(side="left", padx=4)
         ttk.Button(top, text="Delete Selected", command=self._delete).pack(side="left", padx=4)
         ttk.Button(top, text="Reset Password", command=self._reset_pw).pack(side="left", padx=4)
         ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
@@ -885,6 +964,7 @@ class ManageUsersDialog(tk.Toplevel):
         for cid, txt, w, a in cols:
             self.tree.heading(cid, text=txt)
             self.tree.column(cid, width=w, anchor=a)
+        self.tree.bind("<Double-1>", lambda e: self._edit())
         self.refresh()
         try:
             if master.winfo_viewable():
@@ -917,6 +997,50 @@ class ManageUsersDialog(tk.Toplevel):
         if dlg.saved:
             self.refresh()
 
+    def _selected_user_id(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a user first.", parent=self)
+            return None
+        try:
+            return int(sel[0])
+        except (TypeError, ValueError):
+            return None
+
+    def _edit(self):
+        uid = self._selected_user_id()
+        if uid is None:
+            return
+        dlg = EditUserDialog(self, uid)
+        try:
+            self.wait_window(dlg)
+        except Exception:
+            pass
+        if getattr(dlg, "saved", False):
+            self.refresh()
+
+    def _toggle_active(self):
+        uid = self._selected_user_id()
+        if uid is None:
+            return
+        user = db.get_user_by_id(uid)
+        if not user:
+            messagebox.showerror("Not found", "This user no longer exists.", parent=self)
+            self.refresh()
+            return
+        action = "disable" if user["is_active"] else "enable"
+        if not messagebox.askyesno("Confirm", f"{action.capitalize()} user '{user['name']}' ({user['phone']})?", parent=self):
+            return
+        try:
+            db.set_user_active(uid, not user["is_active"])
+        except ValueError as exc:
+            messagebox.showerror("Blocked", str(exc), parent=self)
+            return
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc), parent=self)
+            return
+        self.refresh()
+
     def _delete(self):
         sel = self.tree.selection()
         if not sel:
@@ -927,6 +1051,12 @@ class ManageUsersDialog(tk.Toplevel):
             messagebox.showerror("Blocked", "Cannot delete the last remaining user.", parent=self)
             return
         user = db.get_user_by_id(uid)
+        if user and user["role"] == "admin" and user["is_active"]:
+            others = [u for u in db.list_app_users()
+                      if u["id"] != uid and u["role"] == "admin" and u["is_active"]]
+            if not others:
+                messagebox.showerror("Blocked", "Cannot delete the last active admin. Promote another user to admin first.", parent=self)
+                return
         if messagebox.askyesno("Confirm", f"Delete user '{user['name']}' ({user['phone']})?", parent=self):
             import sqlite3
             from contextlib import closing

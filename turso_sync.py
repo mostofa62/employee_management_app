@@ -174,6 +174,15 @@ def get_turso_config() -> Dict[str, str]:
         pass
     return result
 
+def invalidate_config_cache():
+    global _cached_cfg, _cached_cfg_at
+    try:
+        _cached_cfg = None
+        _cached_cfg_at = 0.0
+    except Exception:
+        pass
+
+
 def set_turso_config(url: Optional[str] = None, token: Optional[str] = None, enabled: Optional[bool] = None) -> Dict[str, str]:
     if url is not None:
         v = (url or "").strip()
@@ -189,6 +198,7 @@ def set_turso_config(url: Optional[str] = None, token: Optional[str] = None, ena
             _db_delete_state(K_TOKEN)
     if enabled is not None:
         _db_set_state(K_ENABLED, "1" if enabled else "0")
+    invalidate_config_cache()
     return get_turso_config()
 
 def is_turso_configured() -> bool:
@@ -675,6 +685,457 @@ def _push_with_libsql(cfg: Dict[str, str]) -> Tuple[bool, str]:
     # For now, fallback to HTTP snapshot - native path not needed for push snapshot.
     return _push_snapshot(cfg)
 
+# ── Hrana SELECT (pull) helpers ─────────────────────────────
+def _hrana_to_python(v: Any) -> Any:
+    """Convert a Hrana value dict to a python value."""
+    try:
+        if not isinstance(v, dict):
+            return v
+        t = v.get("type")
+        if t == "null":
+            return None
+        if t == "integer":
+            try:
+                return int(v.get("value"))
+            except Exception:
+                return 0
+        if t == "float":
+            try:
+                return float(v.get("value"))
+            except Exception:
+                return 0.0
+        if t == "text":
+            return v.get("value")
+        if t == "blob":
+            import base64
+            try:
+                return base64.b64decode(v.get("value") or "")
+            except Exception:
+                return None
+        return v.get("value")
+    except Exception:
+        return None
+
+
+def _query_pipeline(cfg: Dict[str, str], sql: str, params: Optional[List[Any]] = None,
+                    timeout: float = 12.0) -> Tuple[bool, str, List[str], List[List[Any]]]:
+    """Run a single SELECT via Hrana pipeline. Returns (ok, msg, cols, rows).
+
+    Never raises to caller.
+    """
+    url = _pipeline_url(cfg)
+    headers = _headers_for_cfg(cfg)
+    try:
+        if params:
+            args = [_hrana_value(v) for v in params]
+            stmt = {"sql": sql, "args": args}
+        else:
+            stmt = {"sql": sql}
+        body = json.dumps({"requests": [
+            {"type": "execute", "stmt": stmt},
+            {"type": "close"},
+        ]})
+    except Exception as e:
+        return False, f"build failed: {e}"[:300], [], []
+    txt = ""
+    try:
+        try:
+            import requests  # type: ignore
+            resp = requests.post(url, headers=headers, data=body, timeout=timeout)
+            txt = resp.text
+            if not resp.ok:
+                return False, f"HTTP {resp.status_code}: {txt[:400]}", [], []
+            j = resp.json()
+        except ImportError:
+            import urllib.request
+            data = body.encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # type: ignore
+                txt = resp.read().decode("utf-8", errors="ignore")
+                j = json.loads(txt)
+        results = (j.get("results") or [])
+        if not results:
+            return False, "empty response", [], []
+        first = results[0]
+        if first.get("type") == "error":
+            err = first.get("error") or {}
+            return False, str(err.get("message") or err)[:400], [], []
+        response = first.get("response") or {}
+        result = response.get("result") or {}
+        cols_meta = result.get("cols") or []
+        cols = [c.get("name", "") for c in cols_meta if isinstance(c, dict)]
+        raw_rows = result.get("rows") or []
+        rows: List[List[Any]] = []
+        for r in raw_rows:
+            try:
+                rows.append([_hrana_to_python(v) for v in r])
+            except Exception:
+                continue
+        return True, "ok", cols, rows
+    except Exception as e:
+        # urllib HTTPError carries body
+        try:
+            import urllib.error
+            if isinstance(e, urllib.error.HTTPError):  # type: ignore
+                try:
+                    body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else str(e)
+                except Exception:
+                    body = str(e)
+                return False, f"HTTP {e.code}: {body[:400]}", [], []
+        except Exception:
+            pass
+        return False, str(e)[:400], [], []
+
+
+def _remote_table_names(cfg: Dict[str, str]) -> Tuple[bool, str, List[str]]:
+    ok, msg, _cols, rows = _query_pipeline(
+        cfg, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    if not ok:
+        return False, msg, []
+    try:
+        return True, "ok", [str(r[0]) for r in rows if r]
+    except Exception as e:
+        return False, str(e)[:300], []
+
+
+def remote_counts(cfg: Optional[Dict[str, str]] = None) -> Dict[str, int]:
+    """Return remote row counts for key tables. Missing table -> 0, error -> -1."""
+    if cfg is None:
+        cfg = get_turso_config()
+    out = {"employees": -1, "visits": -1, "projects": -1, "users": -1}
+    mapping = {"employees": "employees", "visits": "visits",
+               "projects": "projects", "users": "app_users"}
+    for key, table in mapping.items():
+        try:
+            ok, _msg, _cols, rows = _query_pipeline(
+                cfg, f'SELECT COUNT(*) AS c FROM "{table}"', timeout=10)
+            if ok and rows:
+                out[key] = int(rows[0][0] or 0)
+            else:
+                # table missing on remote (fresh cloud DB) -> treat as 0
+                if "no such table" in str(_msg).lower():
+                    out[key] = 0
+        except Exception:
+            pass
+    return out
+
+
+def remote_has_data(cfg: Optional[Dict[str, str]] = None) -> Tuple[bool, str]:
+    """True if the Turso cloud DB holds business data worth preserving."""
+    if cfg is None:
+        cfg = get_turso_config()
+    try:
+        counts = remote_counts(cfg)
+        if counts.get("employees", -1) == -1 and counts.get("visits", -1) == -1:
+            return False, f"remote unreachable ({counts})"
+        has = (int(counts.get("employees", 0) or 0) > 0
+               or int(counts.get("visits", 0) or 0) > 0)
+        detail = (f"remote employees={counts.get('employees')} "
+                  f"visits={counts.get('visits')} projects={counts.get('projects')} "
+                  f"users={counts.get('users')}")
+        return has, detail
+    except Exception as e:
+        return False, f"check failed: {e}"[:300]
+
+
+def is_first_setup_pull_needed(cfg: Optional[Dict[str, str]] = None) -> Tuple[bool, str]:
+    """True when local DB is fresh/blank but remote has data -> must PULL first.
+
+    This is the data-loss guard for first-run exe installs.
+    """
+    try:
+        import db as _db
+        if not _db.is_fresh_database():
+            return False, "local has data - regular push"
+        if cfg is None:
+            cfg = get_turso_config()
+        has, detail = remote_has_data(cfg)
+        if has:
+            lc = _db.get_business_counts()
+            return True, (f"fresh local DB (employees={lc.get('employees')} "
+                          f"visits={lc.get('visits')}) but cloud has data - "
+                          f"pull required first. [{detail}]")
+        return False, f"fresh local but remote empty - safe to push. [{detail}]"
+    except Exception as e:
+        return False, f"check failed: {e}"[:300]
+
+
+def _pull_snapshot(cfg: Dict[str, str]) -> Tuple[bool, str]:
+    """Full pull: fetch ALL remote rows and overwrite local DB. Never raises.
+
+    Preserves just-entered local Turso credentials (url/token/enabled) so the
+    fresh install stays configured after the restore. Clears local login
+    session since user rows are replaced (caller must ask user to re-login).
+    """
+    try:
+        import db as _db
+    except Exception as e:
+        return False, f"db import failed: {e}"[:300]
+    try:
+        _db.init_db()
+    except Exception:
+        pass
+    # discover remote tables
+    ok, msg, remote_tables = _remote_table_names(cfg)
+    if not ok:
+        # empty cloud DB (brand-new Turso) has no sqlite_master rows? treat as empty
+        if "no such table" in msg.lower():
+            return False, "Remote DB is empty (no tables yet) - nothing to pull; local will be pushed on next sync"
+        return False, f"Remote list failed: {msg}"[:400]
+    remote_set = set(remote_tables)
+    # backup local turso_* config (just-entered credentials must survive restore)
+    preserved: Dict[str, str] = {}
+    try:
+        for k in (K_URL, K_TOKEN, K_ENABLED, K_BACKUP_INTERVAL, K_BACKUP_TIME,
+                  K_LAST_PERIODIC, K_LAST_SYNC, K_LAST_STATUS, K_LAST_ERROR):
+            v = _db.get_app_state(k)
+            if v is not None:
+                preserved[k] = v
+    except Exception:
+        pass
+    # ── Duplicate-admin fix for fresh installs ──────────────────
+    # Fresh exe: user just created 1 bootstrap admin (maybe same phone/email as
+    # the backup). The pull wipes local app_users and restores the cloud copy.
+    # If the fresh admin is:
+    #   - same phone/email as a cloud admin -> must NOT create a UNIQUE error;
+    #     cloud version wins (no duplicate).
+    #   - completely new phone/email -> keep it alongside cloud users so the
+    #     person who just set up the PC isn't lost.
+    # We snapshot local users before wiping and merge distinct ones back.
+    was_fresh = False
+    local_users_backup: List[Dict[str, Any]] = []
+    try:
+        was_fresh = bool(_db.is_fresh_database())
+    except Exception:
+        was_fresh = False
+    if was_fresh:
+        try:
+            with closing(_db._connect()) as _bc:
+                rows = _bc.execute("SELECT * FROM app_users").fetchall()
+                for r in rows:
+                    local_users_backup.append(dict(r))
+        except Exception:
+            local_users_backup = []
+    # fetch remote rows per table (paginated, parent-first order)
+    fetched: Dict[str, Tuple[List[str], List[List[Any]]]] = {}
+    total_rows = 0
+    for table in _TABLES_INSERT_ORDER:
+        if table not in remote_set:
+            fetched[table] = ([], [])
+            continue
+        # local column order (authoritative for local write)
+        try:
+            with closing(_db._connect()) as _c:
+                local_cols = [r[1] for r in _c.execute(f"PRAGMA table_info({table})").fetchall()]
+        except Exception:
+            local_cols = []
+        if not local_cols:
+            continue
+        # SELECT local cols explicitly; fallback to SELECT * on failure (schema drift)
+        select_cols = ", ".join(f'"{c}"' for c in local_cols)
+        cols: List[str] = []
+        all_rows: List[List[Any]] = []
+        use_star = False
+        offset = 0
+        limit = 500
+        for _page in range(2000):  # safety cap: 2000*500 = 1M rows
+            sql = (f'SELECT * FROM "{table}" LIMIT {limit} OFFSET {offset}'
+                   if use_star else
+                   f'SELECT {select_cols} FROM "{table}" LIMIT {limit} OFFSET {offset}')
+            qok, qmsg, qcols, qrows = _query_pipeline(cfg, sql, timeout=15)
+            if not qok:
+                if (not use_star) and ("no such column" in qmsg.lower() or "no such table" in qmsg.lower()):
+                    if "no such table" in qmsg.lower():
+                        break  # table genuinely missing
+                    use_star = True  # retry this page with *
+                    continue
+                return False, f"pull {table} failed: {qmsg}"[:400]
+            if _page == 0:
+                cols = qcols if use_star else list(local_cols)
+            if not qrows:
+                break
+            if use_star:
+                # map star-cols -> local cols (keep intersection)
+                try:
+                    idx = {name: i for i, name in enumerate(qcols)}
+                    mapped = []
+                    for r in qrows:
+                        mapped.append([r[idx[c]] if c in idx else None for c in local_cols])
+                    all_rows.extend(mapped)
+                    cols = list(local_cols)
+                except Exception as e:
+                    return False, f"pull {table} map failed: {e}"[:300]
+            else:
+                all_rows.extend([list(r) for r in qrows])
+            total_rows += len(qrows)
+            if len(qrows) < limit:
+                break
+            offset += limit
+        fetched[table] = (cols if cols else list(local_cols), all_rows)
+    if total_rows == 0:
+        # remote exists but holds no business rows - nothing to restore;
+        # caller should push local instead (avoids wiping just-created admin)
+        return False, "Remote DB has no data rows - nothing to pull; local will be pushed instead"
+    # write to local (FK off, child-first delete, parent-first insert)
+    try:
+        with closing(_db._connect()) as conn:
+            try:
+                conn.execute("PRAGMA foreign_keys=OFF")
+            except Exception:
+                pass
+            with conn:  # transaction
+                for t in _TABLES_DELETE_ORDER:
+                    try:
+                        conn.execute(f'DELETE FROM "{t}"')
+                    except Exception:
+                        pass  # missing table on old local DB
+                for table in _TABLES_INSERT_ORDER:
+                    cols, rows = fetched.get(table, ([], []))
+                    if not cols or not rows:
+                        continue
+                    placeholders = ", ".join("?" for _ in cols)
+                    col_names = ", ".join(f'"{c}"' for c in cols)
+                    sql = f'INSERT OR REPLACE INTO "{table}" ({col_names}) VALUES ({placeholders})'
+                    try:
+                        conn.executemany(sql, [tuple(r) for r in rows])
+                    except Exception as e:
+                        # schema drift on single table should not abort whole restore
+                        # try per-row to salvage, else skip table
+                        try:
+                            for r in rows:
+                                try:
+                                    conn.execute(sql, tuple(r))
+                                except Exception:
+                                    continue
+                        except Exception:
+                            pass
+                # fix AUTOINCREMENT sequences so next local insert does not clash
+                for table in _TABLES_INSERT_ORDER:
+                    try:
+                        cols, _rows = fetched.get(table, ([], []))
+                        if "id" in (cols or []):
+                            conn.execute(
+                                "UPDATE sqlite_sequence SET seq = "
+                                f'(SELECT COALESCE(MAX(id), 0) FROM "{table}") '
+                                "WHERE name = ?", (table,))
+                    except Exception:
+                        pass
+                # merge back distinct bootstrap admin(s) for fresh installs
+                # (same phone/email -> OR IGNORE keeps cloud version, new phone/email -> preserved)
+                if was_fresh and local_users_backup:
+                    for u in local_users_backup:
+                        try:
+                            # INSERT OR IGNORE so duplicate phone/email never raises - cloud wins
+                            conn.execute(
+                                """INSERT OR IGNORE INTO app_users
+                                   (name, phone, email, password_hash, password_salt, role, is_active, is_logged_in, created_at, last_login)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                                (u.get("name"), u.get("phone"), u.get("email"),
+                                 u.get("password_hash"), u.get("password_salt"),
+                                 u.get("role", "admin"), u.get("is_active", 1), 0,
+                                 u.get("created_at"), u.get("last_login")))
+                        except Exception:
+                            continue
+                    # fix sequence again if we inserted extra admin(s)
+                    try:
+                        conn.execute(
+                            "UPDATE sqlite_sequence SET seq = (SELECT COALESCE(MAX(id),0) FROM app_users) WHERE name='app_users'")
+                    except Exception:
+                        pass
+            try:
+                conn.execute("PRAGMA foreign_keys=ON")
+            except Exception:
+                pass
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+    except Exception as e:
+        return False, f"local restore failed: {e}"[:500]
+    # restore preserved turso credentials + mark sync
+    try:
+        for k, v in preserved.items():
+            if k in (K_LAST_SYNC, K_LAST_STATUS, K_LAST_ERROR):
+                continue  # refreshed below
+            _db.set_app_state(k, v)
+        now = datetime.now().isoformat(timespec="seconds")
+        _db.set_app_state(K_LAST_SYNC, now)
+        _db.set_app_state(K_LAST_STATUS, "ok")
+        try:
+            _db.delete_app_state(K_LAST_ERROR)
+        except Exception:
+            pass
+        # sessions from old local admin are invalid now - force re-login
+        try:
+            _db.delete_app_state("stay_logged_in")
+            _db.delete_app_state("stay_logged_in_user_id")
+        except Exception:
+            pass
+        try:
+            with closing(_db._connect()) as _c, _c:
+                _c.execute("UPDATE app_users SET is_logged_in=0")
+                _c.execute("DELETE FROM sync_log WHERE synced=0")
+                _c.execute(
+                    "INSERT INTO sync_log (table_name, record_id, operation) VALUES (?,?,?)",
+                    ("mixed", "pull", "UPDATE"))
+                _c.execute("UPDATE sync_log SET synced=1 WHERE synced=0")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        invalidate_config_cache()
+    except Exception:
+        pass
+    # describe merge result for the admin message
+    try:
+        kept = 0
+        deduped = 0
+        if was_fresh and local_users_backup:
+            with closing(_db._connect()) as _cc:
+                all_phones = {r["phone"] for r in _cc.execute("SELECT phone FROM app_users").fetchall()}
+                all_emails = {str(r["email"]).lower() for r in _cc.execute("SELECT email FROM app_users").fetchall()}
+            remote_phones: set = set()
+            remote_emails: set = set()
+            cols_r, rows_r = fetched.get("app_users", ([], []))
+            if cols_r and rows_r:
+                try:
+                    pi = cols_r.index("phone")
+                    ei = cols_r.index("email")
+                    remote_phones = {str(r[pi]) for r in rows_r if len(r) > pi and r[pi] is not None}
+                    remote_emails = {str(r[ei]).lower() for r in rows_r if len(r) > ei and r[ei] is not None}
+                except Exception:
+                    remote_phones = set()
+                    remote_emails = set()
+            for u in local_users_backup:
+                p = str(u.get("phone") or "")
+                e = str(u.get("email") or "").lower()
+                is_dup = (p in remote_phones) or (e in remote_emails)
+                is_kept = (p in all_phones) or (e in all_emails)
+                # INSERT OR IGNORE: dup -> ignored (deduped), distinct but present -> kept
+                if is_dup:
+                    deduped += 1
+                elif is_kept:
+                    kept += 1
+                else:
+                    # was not kept and not dup -> must have been ignored for other reason, count as deduped
+                    deduped += 1
+        merge_note = ""
+        if was_fresh and local_users_backup:
+            if deduped and not kept:
+                merge_note = " Your fresh admin was the same as a cloud admin, so the cloud account is kept (no duplicate)."
+            elif kept and not deduped:
+                merge_note = " Your new distinct admin was kept alongside the cloud users."
+            elif kept and deduped:
+                merge_note = " Duplicate admin deduped; distinct admin kept."
+    except Exception:
+        merge_note = ""
+    return True, (f"Pulled {total_rows} rows from cloud to this fresh install "
+                  f"({', '.join(f'{t}:{len(fetched.get(t, ([], []))[1])}' for t in _TABLES_INSERT_ORDER if fetched.get(t, ([], []))[1])})."
+                  f"{merge_note} Please re-login." if was_fresh else
+                  f"Pulled {total_rows} rows from cloud (full restore). Please re-login.")
+
+
 # ── Sync orchestration ────────────────────────────────────────
 def _do_sync_internal() -> Tuple[bool, str]:
     cfg = get_turso_config()
@@ -687,6 +1148,20 @@ def _do_sync_internal() -> Tuple[bool, str]:
             return False, "Offline - no network to Turso"
     except Exception as e:
         return False, f"Offline - network check failed: {e}"[:300]
+    # ── FIRST-RUN SAFETY: never push a blank DB over a non-empty cloud ──
+    try:
+        need_pull, reason = is_first_setup_pull_needed(cfg)
+        if need_pull:
+            ok, msg = _pull_snapshot(cfg)
+            if ok:
+                return True, "FIRST SETUP: " + msg
+            # pull failed but remote HAS data -> REFUSE to push (data-loss guard)
+            if "nothing to pull" not in msg.lower() and "remote db is empty" not in msg.lower():
+                return False, ("REFUSED to overwrite cloud with blank local DB. " + reason
+                               + f" Pull attempt: {msg}").strip()[:600]
+            # else: remote really empty -> fall through to normal push
+    except Exception:
+        pass
     try:
         ok, msg = _push_snapshot(cfg)
         return ok, msg
@@ -1011,17 +1486,55 @@ def stop_turso():
                 pass
             _timer = None
 
-# ── Pull (optional) ───────────────────────────────────────────
-def pull_now(timeout: float = 20.0) -> Tuple[bool, str]:
-    """Pull remote -> local (overwrites local). Use carefully. Returns (ok,msg)."""
+# ── Pull (remote -> local) ────────────────────────────────────
+def pull_now(timeout: float = 60.0, force: bool = False) -> Tuple[bool, str]:
+    """Pull remote -> local (overwrites local). Returns (ok, msg).
+
+    Safety: if local DB already has business data and force=False, refuses
+    (to avoid wiping local work). First-setup (fresh local + remote data)
+    always allows pull. Pass force=True from an explicit user-confirmed
+    "Restore from cloud" action to overwrite a non-empty local DB.
+    """
     cfg = get_turso_config()
     if not cfg["url"] or not cfg["token"]:
         return False, "Not configured"
-    if not _has_network_for_cfg(cfg):
-        return False, "Offline"
-    # For HTTP mode we would need to SELECT * from remote and overwrite local.
-    # Implement via pipeline SELECTs? Simpler: not implemented for safety.
-    return False, "Pull not implemented for HTTP mode - restore via Turso dashboard or enable embedded replica"
+    try:
+        if not _has_network_for_cfg(cfg):
+            return False, "Offline - no network to Turso"
+    except Exception as e:
+        return False, f"Offline: {e}"[:300]
+    try:
+        import db as _db
+        if not force and not _db.is_fresh_database():
+            has, detail = remote_has_data(cfg)
+            if has:
+                return False, ("Local DB already has data - pull would overwrite it. "
+                               f"[{detail}] Use force=True only from an explicit "
+                               "'Restore from cloud' confirmation.")
+    except Exception:
+        pass
+    try:
+        # run with a watchdog so a slow network cannot hang the caller forever
+        result: Dict[str, Any] = {}
+        def _run():
+            try:
+                result["ok"], result["msg"] = _pull_snapshot(cfg)
+            except Exception as e:
+                result["ok"], result["msg"] = False, str(e)[:500]
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            return False, "Pull timed out (still running in background)"
+        ok = bool(result.get("ok", False))
+        msg = str(result.get("msg", "unknown"))
+        try:
+            _record_result(ok, ("PULL: " + msg) if ok else msg)
+        except Exception:
+            pass
+        return ok, msg
+    except Exception as e:
+        return False, f"pull failed: {e}"[:500]
 
 
 # ── Tkinter Config Dialog (used by main.py Admin) ─────────────
@@ -1056,6 +1569,7 @@ class TursoConfigDialog:
             def __init__(self, master):
                 super().__init__(master)
                 self.saved = False
+                self.pulled = False  # True when a cloud->local restore happened (re-login required)
                 self.title("Turso Sync - Cloud Backup (turso.tech)")
                 self.resizable(False, False)
                 frm = ttk.Frame(self, padding=18)
@@ -1165,6 +1679,7 @@ class TursoConfigDialog:
                 ttk.Button(btns, text="Clear", command=self._clear).pack(side="left", padx=6)
                 ttk.Button(btns, text="Test Connection", command=self._test).pack(side="left", padx=6)
                 ttk.Button(btns, text="Sync Now", command=self._sync_now).pack(side="left", padx=6)
+                ttk.Button(btns, text="Pull (restore)", command=self._pull).pack(side="left", padx=6)
                 ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
                 ttk.Button(btns, text="Save", command=self._save).pack(side="right", padx=6)
 
@@ -1283,17 +1798,91 @@ class TursoConfigDialog:
                     if not messagebox.askyesno("Save first?", "URL/Token changed. Save to DB before syncing?", parent=self):
                         return
                     set_turso_config(url=url, token=tok, enabled=self.var_enabled.get())
+                # ── FIRST-SETUP: fresh local + cloud has data -> pull, never push ──
+                try:
+                    need_pull, reason = is_first_setup_pull_needed()
+                    if need_pull:
+                        if messagebox.askyesno(
+                                "Fresh install detected",
+                                "This looks like a fresh install (no employees/visits locally) "
+                                "but the cloud already has data.\n\n"
+                                f"{reason}\n\n"
+                                "To avoid WIPING the cloud with blank data, the app will now "
+                                "DOWNLOAD (pull) the cloud data to this PC instead of uploading.\n\n"
+                                "Download cloud data now?",
+                                parent=self):
+                            self.lbl_msg.configure(text="Pulling cloud data...", foreground="#006633")
+                            self.update_idletasks()
+                            ok, msg = pull_now(timeout=60)
+                            if ok:
+                                self.pulled = True
+                                messagebox.showinfo(
+                                    "Downloaded",
+                                    f"{msg}\n\nPlease re-login with your cloud account.",
+                                    parent=self)
+                                self.lbl_msg.configure(text="Pulled: " + msg[:200], foreground="#006633")
+                            else:
+                                messagebox.showerror("Pull failed", msg, parent=self)
+                                self.lbl_msg.configure(text="Pull failed: " + msg[:200], foreground="#cc0000")
+                        return
+                except Exception:
+                    pass
                 self.lbl_msg.configure(text="Syncing...", foreground="#006633")
                 self.update_idletasks()
                 ok, msg = sync_now(block=True, timeout=40)
                 if ok:
-                    messagebox.showinfo("Synced", f"Sync succeeded: {msg}", parent=self)
+                    if msg.startswith("FIRST SETUP:"):
+                        self.pulled = True
+                        messagebox.showinfo(
+                            "Downloaded from cloud",
+                            f"{msg}\n\nPlease re-login with your cloud account.",
+                            parent=self)
+                    else:
+                        messagebox.showinfo("Synced", f"Sync succeeded: {msg}", parent=self)
                     self.lbl_msg.configure(text="Synced: " + msg, foreground="#006633")
                     st = get_status()
                     self.lbl_info.configure(text=f"Last sync: {st['last_sync'] or 'now'} | Network: {st['network']} | Last status: {st['last_status']}")
                 else:
                     messagebox.showerror("Sync failed", msg, parent=self)
                     self.lbl_msg.configure(text="Sync failed: " + msg[:200], foreground="#cc0000")
+
+            def _pull(self):
+                """Explicit 'Restore from cloud' with confirmation (may overwrite local)."""
+                url = self.var_url.get().strip()
+                tok = self.var_token.get().strip()
+                if not url or not tok:
+                    messagebox.showwarning("Missing", "Enter URL and Token first (then Save).", parent=self)
+                    return
+                cur = get_turso_config()
+                if url != cur["url"] or tok != cur["token"]:
+                    if not messagebox.askyesno("Save first?", "URL/Token changed. Save to DB before pulling?", parent=self):
+                        return
+                    set_turso_config(url=url, token=tok, enabled=self.var_enabled.get())
+                try:
+                    import db as _db
+                    fresh = _db.is_fresh_database()
+                except Exception:
+                    fresh = True
+                if not fresh:
+                    if not messagebox.askyesno(
+                            "Overwrite local?",
+                            "This will OVERWRITE this PC's local data with the cloud copy.\n"
+                            "Any local-only changes not yet synced will be LOST.\n\nContinue?",
+                            parent=self):
+                        return
+                self.lbl_msg.configure(text="Pulling cloud data...", foreground="#006633")
+                self.update_idletasks()
+                ok, msg = pull_now(timeout=60, force=True)
+                if ok:
+                    self.pulled = True
+                    messagebox.showinfo(
+                        "Downloaded",
+                        f"{msg}\n\nPlease re-login with your cloud account.",
+                        parent=self)
+                    self.lbl_msg.configure(text="Pulled: " + msg[:200], foreground="#006633")
+                else:
+                    messagebox.showerror("Pull failed", msg, parent=self)
+                    self.lbl_msg.configure(text="Pull failed: " + msg[:200], foreground="#cc0000")
 
             def _save(self):
                 url = self.var_url.get().strip()
@@ -1326,6 +1915,12 @@ class TursoConfigDialog:
                 except Exception:
                     messagebox.showerror("Invalid interval", "Interval must be 0, 3600, 7200, etc.", parent=self)
                     return
+                was_configured = False
+                try:
+                    _cur = get_turso_config()
+                    was_configured = bool(_cur["url"] and _cur["token"])
+                except Exception:
+                    was_configured = False
                 set_turso_config(url=url, token=tok, enabled=enabled)
                 try:
                     set_backup_config(interval_sec=iv, time_str=tstr)
@@ -1333,6 +1928,47 @@ class TursoConfigDialog:
                     pass
                 # ensure enabled flag stored
                 self.saved = True
+                self.pulled = getattr(self, "pulled", False)
+                # ── FIRST-SETUP: fresh admin + Turso just entered -> pull first ──
+                # Fresh exe: blank DB + bootstrap admin, user pastes Turso details.
+                # Pushing now would wipe the cloud. Instead download cloud->local.
+                if enabled and url and tok and not was_configured:
+                    try:
+                        need_pull, reason = is_first_setup_pull_needed()
+                        if need_pull:
+                            if messagebox.askyesno(
+                                    "Fresh install - download cloud data?",
+                                    "Turso details saved.\n\n"
+                                    "This looks like a FRESH install (no employees/visits on this PC) "
+                                    "but your cloud database already has data.\n\n"
+                                    f"{reason}\n\n"
+                                    "YES = download cloud data to this PC now (recommended, safe).\n"
+                                    "NO = keep blank local for now (next auto-sync will also download, "
+                                    "it will NEVER upload blank over cloud).",
+                                    parent=self):
+                                self.lbl_msg.configure(text="Pulling cloud data...", foreground="#006633")
+                                self.update_idletasks()
+                                ok, msg = pull_now(timeout=60)
+                                if ok:
+                                    self.pulled = True
+                                    messagebox.showinfo(
+                                        "Downloaded from cloud",
+                                        f"Turso config saved.\n\n{msg}\n\n"
+                                        "Please re-login with your cloud account "
+                                        "(the temporary first admin was replaced).",
+                                        parent=self)
+                                    self.destroy()
+                                    return
+                                else:
+                                    messagebox.showerror(
+                                        "Download failed",
+                                        f"Turso config saved, but download failed:\n{msg}\n\n"
+                                        "Your cloud data was NOT touched (safe). Try 'Pull (restore)' later.",
+                                        parent=self)
+                                    self.destroy()
+                                    return
+                    except Exception:
+                        pass
                 msg = "Turso config saved to DB." + (" Sync enabled." if enabled else " Sync disabled.")
                 if tstr:
                     msg += f" Periodic daily at {tstr}."

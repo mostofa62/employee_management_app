@@ -2305,9 +2305,36 @@ class App(tk.Tk):
         dlg = turso_sync.TursoConfigDialog(self)  # type: ignore
         self.wait_window(dlg)
         if getattr(dlg, "saved", False):
+            # First-setup pull replaced the local DB (incl. users) -> force re-login
+            if getattr(dlg, "pulled", False):
+                self.set_status("Cloud data downloaded. Please re-login with your cloud account.")
+                self._refresh_turso_status()
+                try:
+                    self.refresh_all()
+                except Exception:
+                    pass
+                messagebox.showinfo(
+                    "Restart required",
+                    "Cloud data was downloaded to this fresh install.\n\n"
+                    "The temporary first admin no longer exists.\n"
+                    "The app will now return to the login screen - "
+                    "please log in with your cloud (Turso) account.",
+                    parent=self)
+                try:
+                    import db as _db
+                    _db.logout_all()
+                    _db.clear_stay_logged_in()
+                except Exception:
+                    pass
+                try:
+                    self.logout()
+                except Exception:
+                    pass
+                return
             self.set_status("Turso config saved. Sync enabled on network available.")
             self._refresh_turso_status()
             # trigger immediate sync if configured
+            # (sync engine itself pulls first on fresh installs - never pushes blank)
             try:
                 if turso_sync.is_turso_configured():
                     self.set_status("Turso syncing...")
@@ -2411,11 +2438,19 @@ class App(tk.Tk):
             return
         dlg = auth.ManageUsersDialog(self)
         self.wait_window(dlg)
-        # refresh status if user self-deleted? just keep
+        # refresh status if user self-deleted/demoted/deactivated
         try:
             fresh = db.get_user_by_id(self.current_user["id"])
             if not fresh:
                 # current admin was deleted -> force logout
+                self._do_logout(clear_stay=True)
+                return
+            if not fresh["is_active"] or fresh["role"] != "admin":
+                # self-demoted or self-disabled -> drop to login screen
+                messagebox.showinfo(
+                    "Account changed",
+                    "Your own account was demoted or disabled.\nReturning to the login screen.",
+                    parent=self)
                 self._do_logout(clear_stay=True)
                 return
             self.current_user = fresh

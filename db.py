@@ -1763,6 +1763,84 @@ def create_app_user(name, phone, email, password, role="admin"):
     return cur.lastrowid
 
 
+def update_app_user(user_id, name, phone, email, role="user", is_active=True):
+    """Edit an existing user's info (name, mobile, email, role, active flag).
+
+    Raises ValueError on invalid input, duplicate phone/email, or when the
+    change would leave no active admin (last-admin protection).
+    """
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        raise ValueError("Invalid user id.")
+    user = get_user_by_id(uid)
+    if not user:
+        raise ValueError("This user no longer exists.")
+    name = _validate_name(name)
+    phone = _validate_phone(phone)
+    email = _validate_email(email)
+    role = (role or "").strip() or "user"
+    if role not in ("admin", "user"):
+        raise ValueError("Role must be 'admin' or 'user'.")
+    is_active = 1 if is_active else 0
+    with closing(_connect()) as conn:
+        clash = conn.execute(
+            "SELECT id FROM app_users WHERE phone = ? AND id <> ?", (phone, uid)
+        ).fetchone()
+        if clash:
+            raise ValueError(f"Phone '{phone}' is already registered to another user.")
+        clash = conn.execute(
+            "SELECT id FROM app_users WHERE LOWER(email) = LOWER(?) AND id <> ?",
+            (email, uid),
+        ).fetchone()
+        if clash:
+            raise ValueError(f"Email '{email}' is already registered to another user.")
+        # Last active admin protection: never demote/deactivate the final one.
+        if user["role"] == "admin" and user["is_active"]:
+            others = conn.execute(
+                "SELECT COUNT(*) FROM app_users WHERE role = 'admin' AND is_active = 1 AND id <> ?",
+                (uid,),
+            ).fetchone()[0] or 0
+            if others == 0 and (role != "admin" or not is_active):
+                raise ValueError(
+                    "Blocked: this is the last active admin. "
+                    "Promote another user to admin first."
+                )
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "UPDATE app_users SET name = ?, phone = ?, email = ?, role = ?, is_active = ? WHERE id = ?",
+            (name, phone, email, role, is_active, uid),
+        )
+    _log_sync('app_users', uid, 'UPDATE', {'phone': phone, 'email': email, 'role': role})
+    return uid
+
+
+def set_user_active(user_id, is_active=True):
+    """Enable/disable a user account. Guards the last active admin."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        raise ValueError("Invalid user id.")
+    user = get_user_by_id(uid)
+    if not user:
+        raise ValueError("This user no longer exists.")
+    is_active = 1 if is_active else 0
+    if user["role"] == "admin" and user["is_active"] and not is_active:
+        with closing(_connect()) as conn:
+            others = conn.execute(
+                "SELECT COUNT(*) FROM app_users WHERE role = 'admin' AND is_active = 1 AND id <> ?",
+                (uid,),
+            ).fetchone()[0] or 0
+            if others == 0:
+                raise ValueError(
+                    "Blocked: cannot disable the last active admin."
+                )
+    with closing(_connect()) as conn, conn:
+        conn.execute("UPDATE app_users SET is_active = ? WHERE id = ?", (is_active, uid))
+    _log_sync('app_users', uid, 'UPDATE', {'is_active': bool(is_active)})
+    return uid
+
+
 def verify_login(identifier, password):
     ident = (identifier or "").strip()
     pw = (password or "")
@@ -2007,3 +2085,49 @@ def get_sync_log_recent(limit=20):
             ).fetchall()
     except Exception:
         return []
+
+
+# ── Fresh-install detection (first-run Turso safety) ─────────
+# A brand-new exe creates a blank employees.db (only schema + default
+# purposes + 1 bootstrap admin). If Turso credentials are entered at this
+# point, a blind local->remote push would OVERWRITE the cloud backup with
+# blank data (data loss). Use this helper to detect that case so the first
+# sync pulls remote->local instead.
+def get_business_counts():
+    """Return counts of business tables. Never raises; missing tables -> 0."""
+    counts = {"employees": 0, "visits": 0, "projects": 0,
+              "tenures": 0, "assignments": 0, "users": 0}
+    try:
+        with closing(_connect()) as conn:
+            tables = {r[0] for r in
+                      conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "employees" in tables:
+                counts["employees"] = conn.execute("SELECT COUNT(*) FROM employees").fetchone()[0] or 0
+            if "visits" in tables:
+                counts["visits"] = conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0] or 0
+            if "projects" in tables:
+                counts["projects"] = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] or 0
+            if "employee_tenures" in tables:
+                counts["tenures"] = conn.execute("SELECT COUNT(*) FROM employee_tenures").fetchone()[0] or 0
+            if "employee_assignments" in tables:
+                counts["assignments"] = conn.execute("SELECT COUNT(*) FROM employee_assignments").fetchone()[0] or 0
+            if "app_users" in tables:
+                counts["users"] = conn.execute("SELECT COUNT(*) FROM app_users").fetchone()[0] or 0
+    except Exception:
+        pass
+    return counts
+
+
+def is_fresh_database():
+    """True when local DB has no business data (first-run blank DB).
+
+    Fresh = zero employees AND zero visits (projects/tenures/assignments
+    are implicitly empty then). The bootstrap admin user (<=1) is ignored
+    because it is created only to enter the app before Turso is configured.
+    """
+    try:
+        c = get_business_counts()
+        return (int(c.get("employees", 0)) == 0 and int(c.get("visits", 0)) == 0
+                and int(c.get("tenures", 0)) == 0 and int(c.get("assignments", 0)) == 0)
+    except Exception:
+        return False
