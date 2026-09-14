@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 employees.db
 .env
+# PyInstaller build outputs
+build/
+dist/
+# keep EmployeeVisitTracker.spec tracked for reproducible builds
+*.manifest
+logo_square.png
