@@ -35,6 +35,338 @@ def _make_tree(parent, columns):
     return frame, tree
 
 
+# ── Searchable Combobox (select2-style) ──────────────────────────
+class _SearchableCombo(tk.Frame):
+    """Select2-style searchable dropdown: type to filter, dropdown tray
+    shows matches, arrows navigate, Enter/click selects, cursor stays
+    in the entry at all times.
+
+    Drop-in replacement for ttk.Combobox with .get()/.set()/.configure(values=).
+    """
+
+    def __init__(self, parent, textvariable=None, values=None, width=30,
+                 get_full_values=None, max_show=100, **kw):
+        super().__init__(parent, highlightthickness=0, bd=0, **kw)
+        self._values = [str(v) for v in (values or [])]
+        self._get_full_values = get_full_values
+        self._max_show = max_show
+        self._filtered = list(self._values)
+        self._sel_idx = -1  # highlighted row in dropdown
+        self._popup = None  # Toplevel dropdown
+        self._lb = None     # Listbox inside popup
+
+        if textvariable is None:
+            textvariable = tk.StringVar()
+        self._var = textvariable
+
+        # styled entry with clear button + dropdown arrow button
+        inner = ttk.Frame(self)
+        inner.pack(fill="both", expand=True)
+        self._entry = ttk.Entry(inner, textvariable=self._var, width=width)
+        self._entry.pack(side="left", fill="both", expand=True)
+        self._clear = ttk.Button(inner, text="\u2715", width=2,
+                                 command=self._clear_text)
+        self._clear.pack(side="right", fill="y")
+        self._arrow = ttk.Button(inner, text="\u25BC", width=3,
+                                 command=self._toggle_popup)
+        self._arrow.pack(side="right", fill="y")
+        self._var.trace_add("write", lambda *_a: self._update_clear_btn())
+
+        # key bindings on the entry
+        self._entry.bind("<KeyRelease>", self._on_key)
+        self._entry.bind("<Down>", self._on_down, add="+")
+        self._entry.bind("<Up>", self._on_up, add="+")
+        self._entry.bind("<Return>", self._on_enter, add="+")
+        self._entry.bind("<Escape>", self._on_escape, add="+")
+        self._entry.bind("<FocusIn>", self._on_focus_in, add="+")
+        self._entry.bind("<FocusOut>", self._on_focus_out, add="+")
+
+        # expose ttk.Combobox-like interface
+        self.get = self._var.get
+        self.set = self._var.set
+        self._update_clear_btn()
+
+    # ── public interface (ttk.Combobox compat) ───────────────
+    def configure(self, **kw):
+        if "values" in kw:
+            self._values = [str(v) for v in (kw.pop("values") or [])]
+            # refresh cache for dynamic getters
+            if self._get_full_values:
+                try:
+                    self._values = [str(v) for v in list(self._get_full_values() or [])]
+                except Exception:
+                    pass
+        if "width" in kw:
+            self._entry.configure(width=kw.pop("width"))
+        if "state" in kw:
+            self._entry.configure(state=kw.pop("state"))
+        if kw:
+            self._entry.configure(**kw)
+
+    config = configure
+
+    def cget(self, key):
+        if key == "values":
+            return self._values
+        if key == "state":
+            return self._entry.cget("state")
+        return self._entry.cget(key)
+
+    def bind(self, sequence=None, func=None, add="+"):
+        # bind to the entry widget so external code (e.g. <<ComboboxSelected>>) works
+        return self._entry.bind(sequence, func, add)
+
+    def state(self, statespec=None):
+        if statespec is None:
+            return self._entry.cget("state")
+        if isinstance(statespec, (list, tuple)):
+            for s in statespec:
+                s = s.lstrip("!")
+                if s == "disabled":
+                    self._entry.configure(state="disabled")
+                    self._arrow.configure(state="disabled")
+                    self._clear.configure(state="disabled")
+                    return
+                elif s == "normal":
+                    self._entry.configure(state="normal")
+                    self._arrow.configure(state="normal")
+                    self._update_clear_btn()
+                    return
+            return
+        self._entry.configure(state=str(statespec))
+
+    def focus_set(self):
+        self._entry.focus_set()
+
+    def focus_get(self):
+        return self._entry.focus_get()
+
+    def winfo_exists(self):
+        try:
+            return self._entry.winfo_exists()
+        except Exception:
+            return True
+
+    def icursor(self, idx):
+        self._entry.icursor(idx)
+
+    def event_generate(self, *a, **kw):
+        self._entry.event_generate(*a, **kw)
+
+    # ── popup lifecycle ──────────────────────────────────────
+    def _reload_cache(self):
+        if self._get_full_values:
+            try:
+                self._values = [str(v) for v in list(self._get_full_values() or [])]
+            except Exception:
+                pass
+
+    def _show_popup(self):
+        if self._popup and self._popup.winfo_exists():
+            return
+        self._popup = tk.Toplevel(self)
+        self._popup.wm_overrideredirect(True)
+        try:
+            self._popup.wm_attributes("-topmost", True)
+        except Exception:
+            pass
+        # frame with border
+        frm = tk.Frame(self._popup, relief="solid", bd=1, bg="#cccccc")
+        frm.pack(fill="both", expand=True)
+        # listbox + scrollbar
+        inner = tk.Frame(frm, bg="white")
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        self._lb = tk.Listbox(inner, height=8, font=("Segoe UI", 11),
+                              selectbackground="#0078D7", selectforeground="white",
+                              activestyle="none", relief="flat", bd=0,
+                              highlightthickness=0)
+        sb = tk.Scrollbar(inner, orient="vertical", command=self._lb.yview)
+        self._lb.configure(yscrollcommand=sb.set)
+        self._lb.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self._lb.bind("<ButtonRelease-1>", self._on_list_click)
+        # position below entry
+        self._position_popup()
+
+    def _position_popup(self):
+        if not self._popup:
+            return
+        x = self._entry.winfo_rootx()
+        y = self._entry.winfo_rooty() + self._entry.winfo_height()
+        w = self._entry.winfo_width() + 26  # entry + arrow button
+        max_visible = min(len(self._filtered), self._max_show, 15)
+        h = max(1, max_visible) * 24 + 4  # ~24px per item
+        # keep on screen
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        if x + w > sw:
+            x = sw - w - 4
+        if y + h > sh:
+            y = self._entry.winfo_rooty() - h - 2
+        self._popup.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _hide_popup(self):
+        if self._popup:
+            try:
+                self._popup.destroy()
+            except Exception:
+                pass
+            self._popup = None
+            self._lb = None
+        self._sel_idx = -1
+
+    def _toggle_popup(self):
+        if self._popup and self._popup.winfo_exists():
+            self._hide_popup()
+        else:
+            self._reload_cache()
+            self._filtered = list(self._values)
+            self._show_popup()
+            self._fill_list()
+            self._entry.focus_set()
+
+    def _clear_text(self, _evt=None):
+        self._var.set("")
+        self._reload_cache()
+        self._filtered = list(self._values)
+        if not self._popup or not self._popup.winfo_exists():
+            self._show_popup()
+        self._fill_list()
+        self._entry.focus_set()
+
+    def _update_clear_btn(self):
+        if self._var.get():
+            self._clear.state(["!disabled"])
+        else:
+            self._clear.state(["disabled"])
+
+    def _fill_list(self):
+        if not self._lb:
+            return
+        self._lb.delete(0, tk.END)
+        for item in self._filtered[:self._max_show]:
+            self._lb.insert(tk.END, item)
+        if self._filtered:
+            self._sel_idx = 0
+            self._lb.selection_set(0)
+            self._lb.see(0)
+            self._lb.activate(0)
+        else:
+            self._sel_idx = -1
+        self._position_popup()
+
+    # ── filtering ────────────────────────────────────────────
+    def _do_filter(self):
+        self._reload_cache()
+        txt = self._var.get().strip()
+        if not txt:
+            self._filtered = list(self._values)
+        else:
+            words = [w for w in txt.lower().split() if w]
+            if words:
+                self._filtered = [v for v in self._values
+                                  if all(w in v.lower() for w in words)]
+                self._filtered.sort(
+                    key=lambda v: (0 if v.lower().startswith(words[0]) else 1,
+                                   v.lower()))
+            else:
+                self._filtered = list(self._values)
+        if not self._popup or not self._popup.winfo_exists():
+            self._show_popup()
+        self._fill_list()
+
+    # ── event handlers ───────────────────────────────────────
+    def _on_key(self, evt=None):
+        if evt and evt.keysym in ("Up", "Down", "Return", "Escape", "Tab",
+                                  "Left", "Right", "Shift_L", "Shift_R",
+                                  "Control_L", "Control_R", "Alt_L", "Alt_R"):
+            return
+        self._do_filter()
+
+    def _on_down(self, _evt=None):
+        if not self._popup or not self._popup.winfo_exists():
+            self._do_filter()
+            return "break"
+        if self._sel_idx < len(self._filtered) - 1:
+            self._sel_idx += 1
+            self._lb.selection_clear(0, tk.END)
+            self._lb.selection_set(self._sel_idx)
+            self._lb.see(self._sel_idx)
+            self._lb.activate(self._sel_idx)
+        return "break"
+
+    def _on_up(self, _evt=None):
+        if self._sel_idx > 0:
+            self._sel_idx -= 1
+            self._lb.selection_clear(0, tk.END)
+            self._lb.selection_set(self._sel_idx)
+            self._lb.see(self._sel_idx)
+            self._lb.activate(self._sel_idx)
+        return "break"
+
+    def _on_enter(self, _evt=None):
+        if self._popup and self._popup.winfo_exists() and self._sel_idx >= 0:
+            self._var.set(self._filtered[self._sel_idx])
+            self._hide_popup()
+            try:
+                self._entry.event_generate("<<ComboboxSelected>>")
+            except Exception:
+                pass
+        return "break"
+
+    def _on_escape(self, _evt=None):
+        if self._popup and self._popup.winfo_exists():
+            self._hide_popup()
+            return "break"
+
+    def _on_focus_in(self, _evt=None):
+        self._reload_cache()
+        self._filtered = list(self._values)
+
+    def _on_focus_out(self, _evt=None):
+        # delay so click on listbox/clear/arrow has time to register
+        def _check():
+            try:
+                f = self.focus_get()
+                if f is self._lb:
+                    return  # click was on listbox, keep open
+                if f is self._clear or f is self._arrow:
+                    return  # click was on clear or arrow button, keep open
+                if f is self._entry and (self._popup and self._popup.winfo_exists()):
+                    return  # focus returned to entry, keep open
+            except Exception:
+                pass
+            self._hide_popup()
+        self.after(150, _check)
+
+    def _on_list_click(self, _evt=None):
+        if not self._lb:
+            return
+        sel = self._lb.curselection()
+        if sel:
+            idx = sel[0]
+            self._var.set(self._filtered[idx])
+            self._hide_popup()
+            self._entry.focus_set()
+            try:
+                self._entry.event_generate("<<ComboboxSelected>>")
+            except Exception:
+                pass
+
+
+def _make_searchable(parent, textvariable=None, values=None, width=30,
+                     get_full_values=None):
+    """Create a select2-style searchable combo. Returns the widget."""
+    w = _SearchableCombo(parent, textvariable=textvariable, values=values,
+                         width=width, get_full_values=get_full_values)
+    return w
+
+
+def _refresh_searchable_values(combo, values):
+    """Update values of a searchable combo without losing typed text."""
+    combo.configure(values=list(values or []))
+
+
 # ── Calendar / Date Picker ───────────────────────────────────
 import calendar as _cal
 
@@ -157,10 +489,10 @@ class _CalendarPopup(tk.Toplevel):
         self.btn_prev_month.pack(side="left", padx=2)
         self.lbl_month = ttk.Label(nav, anchor="center", font=("Segoe UI", 10, "bold"))
         self.lbl_month.pack(side="left", expand=True, fill="x")
-        self.btn_next_month = ttk.Button(nav, width=3, text="▶", command=self._next_month)
-        self.btn_next_month.pack(side="right", padx=2)
         self.btn_next_year = ttk.Button(nav, width=3, text="▶▶", command=self._next_year)
         self.btn_next_year.pack(side="right")
+        self.btn_next_month = ttk.Button(nav, width=3, text="▶", command=self._next_month)
+        self.btn_next_month.pack(side="right", padx=2)
 
         # weekday header
         hdr = ttk.Frame(outer)
@@ -324,10 +656,11 @@ class EmployeeDialog(tk.Toplevel):
         ttk.Combobox(frm, textvariable=self.var_emp_type, state="readonly", width=28,
                      values=list(db.EMPLOYEE_TYPES)).grid(row=7, column=1, sticky="we", pady=4)
         ttk.Label(frm, text="Project").grid(row=8, column=0, sticky="w", padx=(0, 10), pady=4)
-        cmb_project = ttk.Combobox(frm, textvariable=self.var_project, width=28)
-        cmb_project.grid(row=8, column=1, sticky="we", pady=4)
-        cmb_project["values"] = [p["name"] for p in db.list_projects()]
-        hint = ttk.Label(frm, text="Type a new project or pick one - duplicates are merged automatically.",
+        self.cmb_project = _SearchableCombo(frm, textvariable=self.var_project, width=25,
+                                            values=[p["name"] for p in db.list_projects()],
+                                            get_full_values=lambda: [p["name"] for p in db.list_projects()])
+        self.cmb_project.grid(row=8, column=1, sticky="we", pady=4)
+        hint = ttk.Label(frm, text="Type to search, or type a new project - duplicates are merged automatically.",
                          foreground="#666666")
         hint.grid(row=9, column=1, sticky="w", pady=(0, 4))
 
@@ -402,8 +735,9 @@ class VisitForm(ttk.Frame):
         self.var_time_mode = tk.StringVar(value="fixed")
         self.day_rows = {}  # date -> {start_var, end_var, full_var, note_var}
 
-        ttk.Label(self, text="Employee *").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
-        self.cmb_emp = ttk.Combobox(self, textvariable=self.var_emp, state="readonly", width=44)
+        ttk.Label(self, text="Employee * (type to search)").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.cmb_emp = _SearchableCombo(self, textvariable=self.var_emp, width=42,
+                                        get_full_values=lambda: list(self.emp_map.keys()))
         self.cmb_emp.grid(row=0, column=1, sticky="we", pady=4)
 
         ttk.Label(self, text="Visit type *").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
@@ -417,13 +751,16 @@ class VisitForm(ttk.Frame):
         self.lbl_dest.grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
         self.dest_wrap = ttk.Frame(self)
         self.dest_wrap.grid(row=2, column=1, sticky="we", pady=4)
-        self.cmb_country = ttk.Combobox(self.dest_wrap, textvariable=self.var_country, width=42, values=COUNTRIES)
+        self.cmb_country = _SearchableCombo(self.dest_wrap, textvariable=self.var_country, width=40,
+                                            values=list(COUNTRIES),
+                                            get_full_values=lambda: list(COUNTRIES))
         self.cmb_country.pack(fill="x")
         self.ent_location = ttk.Entry(self.dest_wrap, textvariable=self.var_location, width=44)
         # packed on demand by _toggle_destination
 
-        ttk.Label(self, text="Purpose category").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=4)
-        self.cmb_purpose = ttk.Combobox(self, textvariable=self.var_purpose, width=44)
+        ttk.Label(self, text="Purpose category (type to search)").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.cmb_purpose = _SearchableCombo(self, textvariable=self.var_purpose, width=42,
+                                            get_full_values=lambda: [p["name"] for p in db.list_visit_purposes()])
         self.cmb_purpose.grid(row=3, column=1, sticky="we", pady=4)
         self.refresh_purposes()
 
@@ -510,7 +847,7 @@ class VisitForm(ttk.Frame):
             self.lbl_dest.config(text="Location *")
             self.ent_location.pack(fill="x")
         else:
-            self.lbl_dest.config(text="Country *")
+            self.lbl_dest.config(text="Country * (type to search)")
             self.cmb_country.pack(fill="x")
 
     def _toggle_full_day(self):
@@ -702,7 +1039,11 @@ class VisitForm(ttk.Frame):
             names = [p["name"] for p in db.list_visit_purposes()]
         except Exception:
             names = list(db.DEFAULT_PURPOSES)
-        self.cmb_purpose["values"] = names
+        # keep typed new purpose visible while refreshing
+        typed = self.var_purpose.get()
+        if typed and typed not in names:
+            names = names + [typed]
+        _refresh_searchable_values(self.cmb_purpose, names)
 
     def _changed(self):
         if self.on_change:
@@ -713,11 +1054,20 @@ class VisitForm(ttk.Frame):
         self.emp_map = {
             f"{r['emp_id']} - {r['name']} ({r['designation']})": r for r in emp_rows
         }
-        self.cmb_emp["values"] = list(self.emp_map)
+        # refresh searchable list but preserve current selection/typing
+        _refresh_searchable_values(self.cmb_emp, list(self.emp_map))
         if previous in self.emp_map:
             self.var_emp.set(previous)
 
     def selected_employee(self):
+        typed = (self.var_emp.get() or "").strip()
+        if typed in self.emp_map:
+            return self.emp_map.get(typed)
+        # allow picking by emp_id prefix when user typed an ID fragment
+        low = typed.lower()
+        for disp, row in self.emp_map.items():
+            if disp.lower().startswith(low) or row["emp_id"].lower() == low:
+                return row
         return self.emp_map.get(self.var_emp.get())
 
     def payload(self, emp_id):
@@ -811,8 +1161,10 @@ class VisitForm(ttk.Frame):
 
     def clear(self, keep_employee=False):
         keep = self.var_emp.get() if keep_employee else ""
+        self.var_type.set("Abroad")
         self.var_country.set("")
         self.var_location.set("")
+        self.var_purpose.set("")
         self.var_title.set("")
         self.txt_detail.delete("1.0", "end")
         today = datetime.date.today().isoformat()
@@ -822,10 +1174,13 @@ class VisitForm(ttk.Frame):
         self.var_end_time.set("")
         self.var_full_day.set(False)
         self.var_time_mode.set("fixed")
+        self.day_rows.clear()
+        self._toggle_destination()
         self._toggle_full_day()
         self._toggle_time_mode()
         if keep and keep in self.emp_map:
             self.var_emp.set(keep)
+        self._changed()
 
 
 class VisitDialog(tk.Toplevel):
@@ -882,13 +1237,13 @@ class TenureDialog(tk.Toplevel):
         frm = ttk.Frame(self, padding=15)
         frm.grid(sticky="nsew")
 
-        # Employee combobox
-        ttk.Label(frm, text="Employee *").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
+        # Employee combobox (searchable)
+        ttk.Label(frm, text="Employee * (type to search)").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
         self.var_emp = tk.StringVar()
-        self.cmb_emp = ttk.Combobox(frm, textvariable=self.var_emp, state="readonly", width=30)
+        self.cmb_emp = _SearchableCombo(frm, textvariable=self.var_emp, width=28,
+                                        get_full_values=lambda: list(self.emp_map.keys()))
         emps = db.get_employees()
         self.emp_map = {f"{r['emp_id']} - {r['name']}": r["emp_id"] for r in emps}
-        self.cmb_emp["values"] = list(self.emp_map.keys())
         self.cmb_emp.grid(row=0, column=1, sticky="we", pady=4)
 
         ttk.Label(frm, text="Join date * (YYYY-MM-DD)").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
@@ -917,20 +1272,23 @@ class TenureDialog(tk.Toplevel):
         ttk.Combobox(frm, textvariable=self.var_type, state="readonly", width=28,
                      values=list(db.TENURE_TYPES)).grid(row=3, column=1, sticky="we", pady=4)
 
-        ttk.Label(frm, text="Project").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Label(frm, text="Project (type to search)").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=4)
         self.var_project = tk.StringVar()
-        cmb_proj = ttk.Combobox(frm, textvariable=self.var_project, width=28)
-        cmb_proj.grid(row=4, column=1, sticky="we", pady=4)
-        cmb_proj["values"] = [p["name"] for p in db.list_projects()]
+        self.cmb_proj = _SearchableCombo(frm, textvariable=self.var_project, width=28,
+                                         values=[p["name"] for p in db.list_projects()],
+                                         get_full_values=lambda: [p["name"] for p in db.list_projects()])
+        self.cmb_proj.grid(row=4, column=1, sticky="we", pady=4)
 
-        ttk.Label(frm, text="Collaborator Org.").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Label(frm, text="Collaborator Org. (type to search)").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=4)
         self.var_org = tk.StringVar()
-        cmb_org = ttk.Combobox(frm, textvariable=self.var_org, width=28)
-        cmb_org.grid(row=5, column=1, sticky="we", pady=4)
         try:
-            cmb_org["values"] = [o["name"] for o in db.list_organizations()]
+            org_vals = [o["name"] for o in db.list_organizations()]
         except Exception:
-            cmb_org["values"] = []
+            org_vals = []
+        self.cmb_org = _SearchableCombo(frm, textvariable=self.var_org, width=28,
+                                        values=org_vals,
+                                        get_full_values=lambda: [o["name"] for o in db.list_organizations()])
+        self.cmb_org.grid(row=5, column=1, sticky="we", pady=4)
 
         ttk.Label(frm, text="Role / Position").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=4)
         self.var_role = tk.StringVar()
@@ -992,11 +1350,25 @@ class TenureDialog(tk.Toplevel):
             except Exception:
                 pass
 
+    def _resolve_emp_id(self, typed):
+        typed = (typed or "").strip()
+        if typed in self.emp_map:
+            return self.emp_map[typed]
+        low = typed.lower()
+        matches = [(d, eid) for d, eid in self.emp_map.items() if low in d.lower()]
+        if len(matches) == 1:
+            return matches[0][1]
+        # also allow raw emp_id
+        for d, eid in self.emp_map.items():
+            if eid.lower() == low:
+                return eid
+        return None
+
     def _save(self):
         emp_disp = self.var_emp.get().strip()
-        emp_id = self.emp_map.get(emp_disp)
+        emp_id = self._resolve_emp_id(emp_disp)
         if not emp_id:
-            messagebox.showerror("Invalid input", "Please select an employee.", parent=self)
+            messagebox.showerror("Invalid input", "Please select an employee from the list.", parent=self)
             return
         join_date = self.var_join.get().strip()
         release_date = None if self.var_ongoing.get() else self.var_release.get().strip() or None
@@ -1207,6 +1579,71 @@ class App(tk.Tk):
     def set_status(self, msg):
         self.status_var.set(msg)
 
+    # ── Searchable filter helpers ──
+    def _on_filter_combo_focus_out(self, combo, var, default, refresh_fn):
+        """Resolve typed filter text to an exact dropdown value when possible."""
+        try:
+            typed = (var.get() or "").strip()
+        except Exception:
+            return
+        if not typed:
+            try:
+                var.set(default)
+            except Exception:
+                pass
+            try:
+                refresh_fn()
+            except Exception:
+                pass
+            return
+        try:
+            values = list(combo.cget("values") or [])
+        except Exception:
+            values = []
+        if typed in values or typed == default:
+            try:
+                refresh_fn()
+            except Exception:
+                pass
+            return
+        low = typed.lower()
+        if low.startswith("all"):
+            try:
+                var.set(default)
+            except Exception:
+                pass
+            try:
+                refresh_fn()
+            except Exception:
+                pass
+            return
+        matches = [v for v in values if low in v.lower()]
+        if len(matches) == 1:
+            try:
+                var.set(matches[0])
+            except Exception:
+                pass
+        # if 0 or many matches: keep typed text; refresh treats it as
+        # partial (single match) or All (ambiguous) - never a dead empty list.
+        try:
+            refresh_fn()
+        except Exception:
+            pass
+
+    def _resolve_filter_emp_id(self, typed, choices):
+        """Map typed employee filter text to an emp_id (or None = All)."""
+        typed = (typed or "").strip()
+        if not typed or typed.startswith("All"):
+            return None
+        if typed in choices:
+            return typed.split(" - ")[0].strip() or None
+        low = typed.lower()
+        matches = [c for c in choices if low in c.lower()]
+        if len(matches) == 1:
+            return matches[0].split(" - ")[0].strip() or None
+        # ambiguous / no match -> show all rather than an empty list
+        return None
+
     def _build_employees_tab(self):
         tab = self.tab_emp
         tab.rowconfigure(1, weight=1)
@@ -1286,10 +1723,15 @@ class App(tk.Tk):
         self.visits_year_var = tk.StringVar(value="All years")
         self.cmb_visits_year = ttk.Combobox(top, textvariable=self.visits_year_var, state="readonly", width=10)
         self.cmb_visits_year.pack(side="left", padx=(4, 12))
-        ttk.Label(top, text="Employee:").pack(side="left")
+        ttk.Label(top, text="Employee (type to search):").pack(side="left")
         self.visits_emp_var = tk.StringVar(value="All employees")
-        self.cmb_visits_emp = ttk.Combobox(top, textvariable=self.visits_emp_var, state="readonly", width=28)
+        self.cmb_visits_emp = _SearchableCombo(top, textvariable=self.visits_emp_var, width=26,
+                                               values=["All employees"])
         self.cmb_visits_emp.pack(side="left", padx=(4, 12))
+        self.cmb_visits_emp.bind("<<ComboboxSelected>>", lambda e: self.refresh_visits())
+        self.cmb_visits_emp.bind("<FocusOut>", lambda e: self._on_filter_combo_focus_out(
+            self.cmb_visits_emp, self.visits_emp_var, "All employees", self.refresh_visits))
+        self.cmb_visits_emp.bind("<Return>", lambda e: self.refresh_visits())
         ttk.Label(top, text="Type:").pack(side="left")
         self.visits_type_var = tk.StringVar(value="All")
         self.cmb_visits_type = ttk.Combobox(top, textvariable=self.visits_type_var, state="readonly", width=10,
@@ -1429,11 +1871,15 @@ class App(tk.Tk):
         # Top filter / actions
         top = ttk.Frame(tab)
         top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(top, text="Employee:").pack(side="left")
+        ttk.Label(top, text="Employee (type to search):").pack(side="left")
         self.tenure_emp_var = tk.StringVar(value="All employees")
-        self.cmb_tenure_emp = ttk.Combobox(top, textvariable=self.tenure_emp_var, state="readonly", width=28)
+        self.cmb_tenure_emp = _SearchableCombo(top, textvariable=self.tenure_emp_var, width=26,
+                                               values=["All employees"])
         self.cmb_tenure_emp.pack(side="left", padx=(4, 10))
         self.cmb_tenure_emp.bind("<<ComboboxSelected>>", lambda e: self.refresh_tenures())
+        self.cmb_tenure_emp.bind("<FocusOut>", lambda e: self._on_filter_combo_focus_out(
+            self.cmb_tenure_emp, self.tenure_emp_var, "All employees", self.refresh_tenures))
+        self.cmb_tenure_emp.bind("<Return>", lambda e: self.refresh_tenures())
         ttk.Label(top, text="Type:").pack(side="left")
         self.tenure_type_var = tk.StringVar(value="All")
         self.cmb_tenure_type = ttk.Combobox(top, textvariable=self.tenure_type_var, state="readonly", width=12,
@@ -1656,9 +2102,10 @@ class App(tk.Tk):
         ent.pack(side="left", padx=(4, 8))
         ent.bind("<Return>", lambda e: self.add_project())
         ttk.Button(top, text="Add Project", command=self.add_project).pack(side="left", padx=3)
+        ttk.Button(top, text="Edit Selected", command=self.rename_project).pack(side="left", padx=3)
         ttk.Button(top, text="Delete Selected", command=self.delete_project).pack(side="left", padx=3)
         ttk.Button(top, text="Refresh", command=self.refresh_projects).pack(side="left", padx=3)
-        ttk.Label(top, text="(Same name is merged into one project automatically.)",
+        ttk.Label(top, text="(Same name is merged into one project automatically. Double-click to edit.)",
                   foreground="#666666").pack(side="left", padx=10)
 
         cols = [
@@ -1668,6 +2115,7 @@ class App(tk.Tk):
         ]
         frame, self.tree_projects = _make_tree(tab, cols)
         frame.grid(row=1, column=0, sticky="nsew")
+        self.tree_projects.bind("<Double-1>", lambda e: self.rename_project())
 
     def _build_organizations_tab(self):
         tab = self.tab_orgs
@@ -1682,9 +2130,10 @@ class App(tk.Tk):
         ent.pack(side="left", padx=(4, 8))
         ent.bind("<Return>", lambda e: self.add_organization())
         ttk.Button(top, text="Add Organization", command=self.add_organization).pack(side="left", padx=3)
+        ttk.Button(top, text="Edit Selected", command=self._edit_organization_dialog).pack(side="left", padx=3)
         ttk.Button(top, text="Delete Selected", command=self.delete_organization).pack(side="left", padx=3)
         ttk.Button(top, text="Refresh", command=self.refresh_organizations).pack(side="left", padx=3)
-        ttk.Label(top, text="(Same name merged automatically - also auto-created from Tenure History)",
+        ttk.Label(top, text="(Same name merged automatically - also auto-created from Tenure History. Double-click to edit.)",
                   foreground="#666666").pack(side="left", padx=10)
 
         cols = [
@@ -1746,12 +2195,14 @@ class App(tk.Tk):
     def _edit_organization_dialog(self):
         sel = self.tree_orgs.selection()
         if not sel:
+            messagebox.showinfo("No selection", "Select an organization first.", parent=self)
             return
         oid = int(sel[0])
         row = next((o for o in db.list_organizations() if o["id"] == oid), None)
         if not row:
             return
-        new_name = tk.simpledialog.askstring("Rename Organization", f"New name for \"{row['name']}\":", parent=self)
+        new_name = simpledialog.askstring("Edit Organization", f"New name for \"{row['name']}\":",
+                                          parent=self, initialvalue=row["name"])
         if new_name is None:
             return
         new_name = " ".join(new_name.split())
@@ -1760,16 +2211,12 @@ class App(tk.Tk):
             return
         if new_name.lower() == row["name"].lower():
             return
-        # check duplicate
-        if any(o["name"].lower() == new_name.lower() for o in db.list_organizations()):
-            messagebox.showerror("Duplicate", f'An organization named \"{new_name}\" already exists.', parent=self)
+        try:
+            db.rename_organization(oid, new_name)
+        except ValueError as exc:
+            messagebox.showerror("Cannot update", str(exc), parent=self)
             return
-        # simple direct SQL rename (no helper yet)
-        import sqlite3
-        from contextlib import closing
-        with closing(db._connect()) as conn, conn:
-            conn.execute("UPDATE organizations SET name = ? WHERE id = ?", (new_name, oid))
-        self.set_status(f'Organization renamed to \"{new_name}\".')
+        self.set_status(f'Organization renamed to "{new_name}".')
         self.refresh_all()
 
     def refresh_projects(self):
@@ -1796,6 +2243,33 @@ class App(tk.Tk):
         if pid is not None:
             self.tree_projects.selection_set(str(pid))
 
+    def rename_project(self):
+        sel = self.tree_projects.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a project first.", parent=self)
+            return
+        pid = int(sel[0])
+        row = next((p for p in db.list_projects() if p["id"] == pid), None)
+        if not row:
+            return
+        new_name = simpledialog.askstring("Edit Project", f'New name for "{row["name"]}":',
+                                          parent=self, initialvalue=row["name"])
+        if new_name is None:
+            return
+        new_name = " ".join(new_name.split())
+        if not new_name:
+            messagebox.showinfo("Empty name", "Name cannot be empty.", parent=self)
+            return
+        if new_name.lower() == row["name"].lower():
+            return
+        try:
+            db.rename_project(pid, new_name)
+        except ValueError as exc:
+            messagebox.showerror("Cannot update", str(exc), parent=self)
+            return
+        self.set_status(f'Project renamed to "{new_name}".')
+        self.refresh_all()
+
     def delete_project(self):
         sel = self.tree_projects.selection()
         if not sel:
@@ -1817,15 +2291,20 @@ class App(tk.Tk):
     def refresh_tenure_filters(self):
         prev = self.tenure_emp_var.get()
         choices = ["All employees"] + [f"{r['emp_id']} - {r['name']}" for r in db.get_employees()]
-        self.cmb_tenure_emp["values"] = choices
-        if prev not in choices:
-            self.tenure_emp_var.set("All employees")
+        _refresh_searchable_values(self.cmb_tenure_emp, choices)
+        # keep user's partial typing; only reset when it matches nothing at all
+        if prev and prev != "All employees" and prev not in choices:
+            low = prev.lower()
+            if not any(low in c.lower() for c in choices):
+                self.tenure_emp_var.set("All employees")
 
     def refresh_tenures(self):
         emp_disp = self.tenure_emp_var.get()
-        emp_id = None
-        if emp_disp and not emp_disp.startswith("All"):
-            emp_id = emp_disp.split(" - ")[0].strip()
+        try:
+            choices = list(self.cmb_tenure_emp.cget("values") or [])
+        except Exception:
+            choices = []
+        emp_id = self._resolve_filter_emp_id(emp_disp, choices)
         ttype = self.tenure_type_var.get()
         rows = db.list_tenures(emp_id=emp_id, tenure_type=None if ttype == "All" else ttype)
         self.tree_tenure.delete(*self.tree_tenure.get_children())
@@ -1945,16 +2424,20 @@ class App(tk.Tk):
 
         prev = self.visits_emp_var.get()
         choices = ["All employees"] + [f"{r['emp_id']} - {r['name']}" for r in db.get_employees()]
-        self.cmb_visits_emp["values"] = choices
-        if prev not in choices:
-            self.visits_emp_var.set("All employees")
+        _refresh_searchable_values(self.cmb_visits_emp, choices)
+        if prev and prev != "All employees" and prev not in choices:
+            low = prev.lower()
+            if not any(low in c.lower() for c in choices):
+                self.visits_emp_var.set("All employees")
 
     def refresh_visits(self):
         year = self.visits_year_var.get()
         emp_disp = self.visits_emp_var.get()
-        emp_id = None
-        if emp_disp and not emp_disp.startswith("All"):
-            emp_id = emp_disp.split(" - ")[0].strip()
+        try:
+            choices = list(self.cmb_visits_emp.cget("values") or [])
+        except Exception:
+            choices = []
+        emp_id = self._resolve_filter_emp_id(emp_disp, choices)
         vtype = self.visits_type_var.get() if hasattr(self, "visits_type_var") else "All"
         rows = db.list_visits(year=None if year == "All years" else year, emp_id=emp_id,
                               visit_type=None if vtype == "All" else vtype)
@@ -2133,7 +2616,7 @@ class App(tk.Tk):
         except Exception:
             saved_start = self.vform.var_start.get()
         self.set_status(f'Visit saved for {emp["name"]} ({self.vform.var_type.get()}) starting {saved_start}.')
-        self.vform.clear(keep_employee=True)
+        self.vform.clear(keep_employee=False)
         self.refresh_all()
 
     def edit_visit(self):

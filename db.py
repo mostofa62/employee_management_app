@@ -435,6 +435,23 @@ def delete_project(project_id):
     _log_sync('projects', project_id, 'DELETE')
 
 
+def rename_project(project_id, new_name):
+    text = " ".join((new_name or "").split())
+    if not text:
+        raise ValueError("Project name cannot be empty.")
+    with closing(_connect()) as conn, conn:
+        exists = conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if not exists:
+            raise ValueError("This project no longer exists.")
+        clash = conn.execute(
+            "SELECT 1 FROM projects WHERE name = ? AND id <> ?", (text, project_id)
+        ).fetchone()
+        if clash:
+            raise ValueError(f'A project named "{text}" already exists.')
+        conn.execute("UPDATE projects SET name = ? WHERE id = ?", (text, project_id))
+    _log_sync('projects', project_id, 'UPDATE', {'name': text})
+
+
 def _clean_employee(emp_id, name, designation, phone_primary, phone_secondary, email, max_visits, emp_type):
     emp_id = (emp_id or "").strip()
     name = (name or "").strip()
@@ -1226,6 +1243,23 @@ def delete_organization(org_id):
         conn.execute("UPDATE employee_assignments SET organization_id = NULL WHERE organization_id = ?", (org_id,))
         conn.execute("DELETE FROM organizations WHERE id = ?", (org_id,))
     _log_sync('organizations', org_id, 'DELETE')
+
+
+def rename_organization(org_id, new_name):
+    text = " ".join((new_name or "").split())
+    if not text:
+        raise ValueError("Organization name cannot be empty.")
+    with closing(_connect()) as conn, conn:
+        exists = conn.execute("SELECT 1 FROM organizations WHERE id = ?", (org_id,)).fetchone()
+        if not exists:
+            raise ValueError("This organization no longer exists.")
+        clash = conn.execute(
+            "SELECT 1 FROM organizations WHERE name = ? AND id <> ?", (text, org_id)
+        ).fetchone()
+        if clash:
+            raise ValueError(f'An organization named "{text}" already exists.')
+        conn.execute("UPDATE organizations SET name = ? WHERE id = ?", (text, org_id))
+    _log_sync('organizations', org_id, 'UPDATE', {'name': text})
 
 
 # ── Tenure helpers ─────────────────────────────────────────────
